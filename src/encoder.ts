@@ -246,7 +246,7 @@ function createPitmBox(primaryItemId: number): Uint8Array {
 }
 
 function createIlocBox(itemId: number, dataSize: number): Uint8Array {
-  const size = 28
+  const size = 30 // 8 (header) + 4 (version/flags) + 2 (offset/length sizes) + 2 (item count) + 2 (item id) + 2 (data ref) + 2 (extent count) + 4 (offset) + 4 (length)
   const buffer = new Uint8Array(size)
   const view = new DataView(buffer.buffer)
 
@@ -425,7 +425,7 @@ function createAv1CBox(): Uint8Array {
 }
 
 function createIpmaBox(): Uint8Array {
-  const size = 17
+  const size = 18 // 8 (header) + 4 (version/flags) + 4 (entry count) + 2 (item id)
   const buffer = new Uint8Array(size)
   const view = new DataView(buffer.buffer)
 
