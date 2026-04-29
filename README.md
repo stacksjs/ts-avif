@@ -77,10 +77,12 @@ console.log(info)
 Decodes an AVIF image buffer to RGBA pixel data.
 
 **Options:**
+
 - `format?: 'rgba' | 'rgb'` - Output format (default: 'rgba')
 - `ignoreAlpha?: boolean` - Ignore alpha channel
 
 **Returns:**
+
 - `data: Uint8Array` - Pixel data
 - `width: number` - Image width in pixels
 - `height: number` - Image height in pixels
@@ -92,6 +94,7 @@ Decodes an AVIF image buffer to RGBA pixel data.
 Encodes RGBA pixel data to AVIF format.
 
 **Options:**
+
 - `quality?: number` - Quality (0-100, default: 80)
 - `lossless?: boolean` - Use lossless encoding
 - `effort?: number` - Speed/effort trade-off (0-10, default: 6)
@@ -116,6 +119,7 @@ The library fully supports parsing HEIF/ISOBMFF container format:
 This is a pure TypeScript implementation of AVIF decoding and encoding. AV1 is a complex codec, and this implementation focuses on still image support (AVIF).
 
 Key components:
+
 - HEIF container parsing (ISO Base Media File Format)
 - AV1 OBU (Open Bitstream Unit) parsing
 - AV1 sequence header and frame decoding framework

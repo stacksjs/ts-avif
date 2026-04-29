@@ -132,14 +132,14 @@ function parseSequenceHeader(data: Uint8Array): SequenceHeader {
   }
 
   // Color config
-  let highBitdepth = false
-  let twelveBit = false
-  let monochrome = false
-  let colorSpace = 0
-  let subX = 1
-  let subY = 1
-  let matrixCoefficients = 0
-  let colorRange = false
+  const highBitdepth = false
+  const twelveBit = false
+  const monochrome = false
+  const colorSpace = 0
+  const subX = 1
+  const subY = 1
+  const matrixCoefficients = 0
+  const colorRange = false
 
   if (!reducedStillPictureHeader) {
     // Parse remaining sequence header for color info
@@ -188,7 +188,7 @@ function decodeFrame(data: Uint8Array, seqHeader: SequenceHeader): Uint8Array {
   const numPixels = width * height
 
   // For a complete implementation, this would:
-  // 1. Parse frame header
+  // 1. Parse frame header from data
   // 2. Decode tiles
   // 3. Apply transforms (DCT, ADST, identity)
   // 4. Apply intra prediction
@@ -196,6 +196,7 @@ function decodeFrame(data: Uint8Array, seqHeader: SequenceHeader): Uint8Array {
   // 6. Apply CDEF (Constrained Directional Enhancement Filter)
   // 7. Apply loop restoration
   // 8. Convert YUV to RGB
+  void data
 
   // For now, return a gray placeholder
   const rgba = new Uint8Array(numPixels * 4)

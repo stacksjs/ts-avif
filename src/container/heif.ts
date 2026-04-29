@@ -444,7 +444,7 @@ export function getAvifInfo(boxes: ISOBMFFBox[]): AvifInfo {
 
   // Get codec config from av1C
   const av1cBox = findBox(ipcoBox.children, 'av1C')
-  let colorSpace = 'srgb'
+  const colorSpace = 'srgb'
 
   if (av1cBox) {
     const config = parseAv1C(av1cBox.data)
