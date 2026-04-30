@@ -41,7 +41,10 @@ export function parseISOBMFF(buffer: Uint8Array): ISOBMFFBox[] {
       boxSize = buffer.length - offset
     }
 
-    const data = buffer.slice(offset + headerSize, offset + boxSize)
+    // subarray is a view into the same memory — slice would copy. For a
+    // typical AVIF with a few dozen nested boxes this avoids ≈ N×fileSize
+    // bytes of pointless allocation.
+    const data = buffer.subarray(offset + headerSize, offset + boxSize)
 
     const box: ISOBMFFBox = {
       type,
@@ -52,7 +55,14 @@ export function parseISOBMFF(buffer: Uint8Array): ISOBMFFBox[] {
 
     // Parse container boxes
     if (isContainerBox(type)) {
-      box.children = parseISOBMFF(data)
+      // ISOBMFF FullBoxes carry a 4-byte version+flags prefix before
+      // their children. If we don't skip it, the version word gets
+      // misinterpreted as the size field of a phantom first child,
+      // which then masks every real child. `meta` and `iref` are the
+      // FullBoxes in our `containerTypes` list — both need the skip.
+      const isFullBoxContainer = type === 'meta' || type === 'iref'
+      const childrenStart = isFullBoxContainer ? 4 : 0
+      box.children = parseISOBMFF(data.subarray(childrenStart))
     }
 
     boxes.push(box)
@@ -502,15 +512,14 @@ export function getImageData(
     return null
   }
 
-  // Find mdat box for data offset
-  const mdatBox = findBox(boxes, 'mdat')
-  const mdatOffset = mdatBox ? mdatBox.offset + 8 : 0
-
-  // Collect all extents
+  // For construction_method=0 the iloc extent_offset is an absolute file
+  // offset (when base_offset_size=0) — we should NOT add mdat's location
+  // again; doing so produced truncated reads, e.g. 75097 bytes returned
+  // when the actual extent was 75379. Just trust iloc.
   const parts: Uint8Array[] = []
 
   for (const extent of location.extents) {
-    const offset = location.baseOffset + extent.extentOffset + mdatOffset
+    const offset = location.baseOffset + extent.extentOffset
     const data = buffer.slice(offset, offset + extent.extentLength)
     parts.push(data)
   }

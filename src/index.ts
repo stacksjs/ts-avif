@@ -1,5 +1,7 @@
 export { decode } from './decoder'
 export { encode } from './encoder'
+export { optimize, optimizeWithStats, remux } from './optimize'
+export type { OptimizeResult, OptimizeStats } from './optimize'
 export {
   parseISOBMFF,
   findBox,
