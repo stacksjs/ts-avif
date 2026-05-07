@@ -28,6 +28,20 @@ export interface AvifEncodeOptions {
   alpha?: boolean
   /** Chroma subsampling (default: '4:2:0') */
   chromaSubsampling?: '4:2:0' | '4:2:2' | '4:4:4'
+  /**
+   * Encoder backend selection.
+   *
+   *   - `'auto'` (default): try the system `avifenc` binary; fall back
+   *     to the pure-TS encoder when it isn't on PATH or fails. Note:
+   *     the pure-TS path is currently a stub — it produces a valid
+   *     AVIF container with placeholder frame data. Use `'auto'` (or
+   *     install libavif) for real output.
+   *   - `'cli'`: require the `avifenc` binary; throw if it's missing.
+   *   - `'pure-ts'`: always use the bundled stub encoder (legacy).
+   */
+  backend?: 'auto' | 'cli' | 'pure-ts'
+  /** Override the path to the `avifenc` binary. */
+  avifencPath?: string
 }
 
 /**

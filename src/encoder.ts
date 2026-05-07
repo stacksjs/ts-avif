@@ -2,10 +2,19 @@ import type { AvifEncodeOptions, AvifImageData } from './types'
 import { OBUType } from './types'
 import { createOBU, writeLeb128 } from './av1/obu'
 import { createFtyp } from './container/heif'
+import { encodeViaAvifenc, hasAvifenc } from './encoder-cli'
 
 /**
- * Encode RGBA pixel data to AVIF format
- * Note: This is a simplified implementation
+ * Encode RGBA pixel data to AVIF format.
+ *
+ * Tries `avifenc` (libavif CLI) first when available — that's the
+ * only path that produces real AV1 image data. The bundled fallback
+ * builds a syntactically valid container around stub frame bytes;
+ * fine for testing the container layout, useless for actual delivery.
+ *
+ * Set `options.backend = 'pure-ts'` to force the bundled path (e.g.
+ * for tests that assert container structure without depending on a
+ * system binary).
  */
 export function encode(
   imageData: AvifImageData,
@@ -19,6 +28,39 @@ export function encode(
 
   // Create AVIF container
   return createAvifContainer(av1Data, width, height, imageData.hasAlpha)
+}
+
+/**
+ * Async-aware encoder that tries `avifenc` (libavif) first when
+ * available — that's the only path producing real AV1 image data.
+ * Falls back to the bundled stub encoder when the binary is missing
+ * (the stub writes a valid AVIF container around placeholder frame
+ * bytes; useful for testing layout, not for real delivery).
+ *
+ * New code should prefer this over `encode()` for any production
+ * output.
+ */
+export async function encodeAsync(
+  imageData: AvifImageData,
+  options: AvifEncodeOptions = {},
+): Promise<Uint8Array> {
+  const backend = options.backend ?? 'auto'
+
+  if (backend !== 'pure-ts') {
+    if (await hasAvifenc(options.avifencPath)) {
+      const cliBytes = await encodeViaAvifenc(imageData, options)
+      if (cliBytes) return cliBytes
+    }
+    if (backend === 'cli') {
+      throw new Error(
+        'ts-avif: avifenc binary not found on PATH (or failed). '
+        + 'Install libavif (`brew install libavif` / `apt-get install libavif-tools`), '
+        + 'set options.avifencPath, or use backend: "pure-ts".',
+      )
+    }
+  }
+
+  return encode(imageData, options)
 }
 
 function encodeAV1(
