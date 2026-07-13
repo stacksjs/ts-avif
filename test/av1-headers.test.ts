@@ -3,7 +3,8 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'bun:test'
 import { getAvifMetadata, getItemPayload, parseISOBMFF } from '../src'
 import { BitReader, BitWriter, ceilLog2, floorLog2 } from '../src/av1/bits'
-import { encodeSequenceHeader } from '../src/av1/encode-headers'
+import { encodeFrameHeader, encodeSequenceHeader } from '../src/av1/encode-headers'
+import { parseFrameHeader } from '../src/av1/frame-header'
 import { parseOBUs } from '../src/av1/obu'
 import { parseSequenceHeader } from '../src/av1/sequence'
 import { parseFrameOBU } from '../src/av1/tile-group'
@@ -101,6 +102,22 @@ describe('encodeSequenceHeader', () => {
       expect(seq.subsamplingX).toBe(1)
       expect(seq.subsamplingY).toBe(1)
       expect(seq.colorRange).toBe(true)
+    }
+  })
+})
+
+describe('encodeFrameHeader', () => {
+  it('round-trips single-tile lossy and lossless frame headers', () => {
+    for (const [width, height, q] of [[1, 1, 0], [17, 9, 80], [512, 384, 128], [4096, 2304, 255]]) {
+      const seq = parseSequenceHeader(encodeSequenceHeader(width, height))
+      const header = parseFrameHeader(new BitReader(encodeFrameHeader(width, height, q)), seq)
+      expect(header.frameWidth).toBe(width)
+      expect(header.frameHeight).toBe(height)
+      expect(header.quantization.baseQIdx).toBe(q)
+      expect(header.codedLossless).toBe(q === 0)
+      expect(header.tileInfo.tileCols).toBe(1)
+      expect(header.tileInfo.tileRows).toBe(1)
+      expect(header.reducedTxSet).toBe(true)
     }
   })
 })
