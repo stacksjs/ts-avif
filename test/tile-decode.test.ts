@@ -56,10 +56,11 @@ describe('TileDecoder (real file)', () => {
     let luma4x4 = 0
     const modes = new Map<number, number>()
     const counter: Reconstructor = {
-      startBlock(bs: number, b: Av1Block) {
+      startBlock(_bs: number, b: Av1Block) {
         blocks++
         modes.set(b.yMode, (modes.get(b.yMode) ?? 0) + 1)
       },
+      predictCfl() {},
       reconTxBlock(plane: number, _bx4, _by4, _tx, _txtp, eob: number, _cf, _b, _dec: TileDecoder) {
         txBlocks++
         if (eob >= 0)

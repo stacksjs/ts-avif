@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'bun:test'
+import { decode as decodeJpeg } from 'ts-jpeg'
 import { decode, getAvifMetadata, getItemPayload, parseISOBMFF } from '../src'
 import { parseOBUs } from '../src/av1/obu'
 import { OBUType } from '../src/types'
@@ -35,12 +36,31 @@ describe('item payload (real file)', () => {
 })
 
 describe('decode (real file)', () => {
-  it('fails loudly (not a silent gray placeholder) until the AV1 core lands', () => {
-    expect(() => decode(fixture)).toThrow(/AV1 frame decoding is not implemented/)
-  })
+  it('decodes photo-small.avif within 30dB PSNR of the ground truth', () => {
+    const img = decode(fixture)
+    expect(img.width).toBe(512)
+    expect(img.height).toBe(384)
+    expect(img.data.length).toBe(512 * 384 * 4)
 
-  // Ground truth for the future entropy decoder:
-  // test/fixtures/photo-small.groundtruth.jpg is a q95 JPEG of the correct
-  // decode. Once decode() produces pixels, compare with PSNR >= 30dB.
-  it.todo('decodes photo-small.avif within 30dB PSNR of the ground truth')
+    const truth = decodeJpeg(
+      readFileSync(join(import.meta.dir, 'fixtures', 'photo-small.groundtruth.jpg')),
+      { useTArray: true },
+    )
+    expect(truth.width).toBe(512)
+    expect(truth.height).toBe(384)
+
+    // PSNR over RGB (alpha is constant)
+    let sse = 0
+    let n = 0
+    for (let i = 0; i < img.data.length; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        const d = img.data[i + c] - truth.data[i + c]
+        sse += d * d
+        n++
+      }
+    }
+    const mse = sse / n
+    const psnr = 10 * Math.log10((255 * 255) / mse)
+    expect(psnr).toBeGreaterThanOrEqual(30)
+  })
 })

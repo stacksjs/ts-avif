@@ -148,11 +148,19 @@ class BlockContext {
 
 /** Pixel-level reconstruction hooks, invoked in bitstream order. */
 export interface Reconstructor {
-  /** Intra-predict one luma tx block and add the residual in `cf`. */
+  /** Called once per block before its tx-block loops. */
+  startBlock: (bs: number, b: Av1Block, dec: TileDecoder) => void
+  /** Whole-block CFL chroma prediction, after luma reconstruction. */
+  predictCfl: (b: Av1Block, dec: TileDecoder, cbw4: number, cbh4: number, cw4: number, ch4: number) => void
+  /**
+   * Predict one tx block and add its residual (`eob` = -1 means none;
+   * `bx`/`by` are in the plane's own 4px units; `edgeFlags` carries the
+   * I444-style top-right/bottom-left availability for this tx block).
+   */
   reconTxBlock: (
     plane: number,
-    bx4: number,
-    by4: number,
+    bx: number,
+    by: number,
     tx: number,
     txtp: number,
     eob: number,
@@ -161,8 +169,6 @@ export interface Reconstructor {
     dec: TileDecoder,
     edgeFlags: number,
   ) => void
-  /** Called once per block before its tx blocks, for whole-block prediction (CFL/etc). */
-  startBlock: (bs: number, b: Av1Block, dec: TileDecoder, intraEdgeFlags: number) => void
 }
 
 export class TileDecoder {
@@ -696,8 +702,8 @@ export class TileDecoder {
     b: Av1Block,
     w4: number,
     h4: number,
-    _cbw4: number,
-    _cbh4: number,
+    cbw4: number,
+    cbh4: number,
     hasChroma: boolean,
     intraEdgeFlags: number,
   ): void {
@@ -712,19 +718,28 @@ export class TileDecoder {
     const cw4 = (w4 + ssHor) >> ssHor
     const ch4 = (h4 + ssVer) >> ssVer
 
-    this.recon?.startBlock(bs, b, this, intraEdgeFlags)
+    this.recon?.startBlock(bs, b, this)
 
     for (let initY = 0; initY < h4; initY += 16) {
       const subH4 = Math.min(h4, 16 + initY)
       const subCh4 = Math.min(ch4, (initY + 16) >> ssVer)
       for (let initX = 0; initX < w4; initX += 16) {
         const subW4 = Math.min(w4, initX + 16)
+        const sbHasTr = initX + 16 < w4
+          ? 1
+          : initY ? 0 : intraEdgeFlags & 0x01 /* EDGE_I444_TOP_HAS_RIGHT */
+        const sbHasBl = initX
+          ? 0
+          : initY + 16 < h4 ? 1 : intraEdgeFlags & 0x08 /* EDGE_I444_LEFT_HAS_BOTTOM */
 
         // luma tx blocks
         let x = 0
         let y = 0
         for (y = initY, this.by += initY; y < subH4; y += tDim.h, this.by += tDim.h) {
           for (x = initX, this.bx += initX; x < subW4; x += tDim.w, this.bx += tDim.w) {
+            const txEdgeFlags
+              = (((y > initY || !sbHasTr) && (x + tDim.w >= subW4)) ? 0 : 0x01)
+                | ((x > initX || (!sbHasBl && y + tDim.h >= subH4)) ? 0 : 0x08)
             if (!b.skip) {
               this.cf.fill(0)
               const { eob, txtp, ctx } = this.decodeCoefs(
@@ -740,28 +755,23 @@ export class TileDecoder {
               )
               this.a.lcoef.fill(ctx, bx4 + x, bx4 + x + Math.min(tDim.w, this.bw4 - this.bx))
               this.l.lcoef.fill(ctx, by4 + y, by4 + y + Math.min(tDim.h, this.bh4 - this.by))
-              if (eob >= 0) {
-                this.recon?.reconTxBlock(
-                  0,
-                  this.bx,
-                  this.by,
-                  b.tx,
-                  txtp,
-                  eob,
-                  this.cf,
-                  b,
-                  this,
-                  intraEdgeFlags,
-                )
-              }
-              else {
-                this.recon?.reconTxBlock(0, this.bx, this.by, b.tx, txtp, -1, this.cf, b, this, intraEdgeFlags)
-              }
+              this.recon?.reconTxBlock(
+                0,
+                this.bx,
+                this.by,
+                b.tx,
+                txtp,
+                eob,
+                this.cf,
+                b,
+                this,
+                txEdgeFlags,
+              )
             }
             else {
               this.a.lcoef.fill(0x40, bx4 + x, bx4 + x + tDim.w)
               this.l.lcoef.fill(0x40, by4 + y, by4 + y + tDim.h)
-              this.recon?.reconTxBlock(0, this.bx, this.by, b.tx, 0, -1, this.cf, b, this, intraEdgeFlags)
+              this.recon?.reconTxBlock(0, this.bx, this.by, b.tx, 0, -1, this.cf, b, this, txEdgeFlags)
             }
           }
           this.bx -= x
@@ -771,12 +781,27 @@ export class TileDecoder {
         if (!hasChroma)
           continue
 
+        if (b.uvMode === IntraPredMode.CFL_PRED && initX === 0 && initY === 0)
+          this.recon?.predictCfl(b, this, cbw4, cbh4, cw4, ch4)
+
+        const uvSbHasTr = ((initX + 16) >> ssHor) < cw4
+          ? 1
+          : initY ? 0 : intraEdgeFlags & (0x04 >> (this.layout - 1))
+        const uvSbHasBl = initX
+          ? 0
+          : ((initY + 16) >> ssVer) < ch4
+            ? 1
+            : intraEdgeFlags & (0x20 >> (this.layout - 1))
+
         const subCw4 = Math.min(cw4, (initX + 16) >> ssHor)
         for (let pl = 0; pl < 2; pl++) {
           for (y = initY >> ssVer, this.by += initY; y < subCh4;
             y += uvTDim.h, this.by += uvTDim.h << ssVer) {
             for (x = initX >> ssHor, this.bx += initX; x < subCw4;
               x += uvTDim.w, this.bx += uvTDim.w << ssHor) {
+              const txEdgeFlags
+                = (((y > (initY >> ssVer) || !uvSbHasTr) && (x + uvTDim.w >= subCw4)) ? 0 : 0x01)
+                  | ((x > (initX >> ssHor) || (!uvSbHasBl && y + uvTDim.h >= subCh4)) ? 0 : 0x08)
               if (!b.skip) {
                 this.cf.fill(0)
                 const { eob, txtp, ctx } = this.decodeCoefs(
@@ -804,13 +829,13 @@ export class TileDecoder {
                   this.cf,
                   b,
                   this,
-                  intraEdgeFlags,
+                  txEdgeFlags,
                 )
               }
               else {
                 this.a.ccoef[pl].fill(0x40, cbx4 + x, cbx4 + x + uvTDim.w)
                 this.l.ccoef[pl].fill(0x40, cby4 + y, cby4 + y + uvTDim.h)
-                this.recon?.reconTxBlock(1 + pl, this.bx >> ssHor, this.by >> ssVer, b.uvtx, 0, -1, this.cf, b, this, intraEdgeFlags)
+                this.recon?.reconTxBlock(1 + pl, this.bx >> ssHor, this.by >> ssVer, b.uvtx, 0, -1, this.cf, b, this, txEdgeFlags)
               }
             }
             this.bx -= x << ssHor
