@@ -41,6 +41,7 @@ import {
   TX_TYPES_PER_SET,
   TXFM_DIMENSIONS,
   TXTP_FROM_UVMODE,
+  YMODE_SIZE_CONTEXT,
 } from './tables'
 
 export interface TxfmInfo {
@@ -68,6 +69,15 @@ for (let i = 0; i < TXFM_DIMENSIONS.length; i += 8) {
   })
 }
 export { TXFM_INFO }
+
+const INTERINTRA_ALLOWED_MASK
+  = (1 << BlockSize.BS_32x32)
+    | (1 << BlockSize.BS_32x16)
+    | (1 << BlockSize.BS_16x32)
+    | (1 << BlockSize.BS_16x16)
+    | (1 << BlockSize.BS_16x8)
+    | (1 << BlockSize.BS_8x16)
+    | (1 << BlockSize.BS_8x8)
 
 // dav1d_filter_mode_to_y_mode: y mode implied by each filter-intra mode
 const FILTER_MODE_TO_Y_MODE_LOCAL = [
@@ -1036,6 +1046,33 @@ export class TileDecoder {
       this.readMvResidual(b, this.hdr.forceIntegerMv ? -1 : this.hdr.allowHighPrecisionMv ? 1 : 0)
     }
 
+    // Inter-intra is signaled after the motion mode. Consume the disabled
+    // branch so streams that merely advertise the tool remain synchronized,
+    // and reject an actually selected blend before reconstructing pixels.
+    if (this.seq.enableInterintraCompound && (INTERINTRA_ALLOWED_MASK & (1 << bs))) {
+      const sizeContext = (YMODE_SIZE_CONTEXT as readonly number[])[bs]
+      const interintra = this.msac.decodeBoolAdapt(
+        this.cdf.data,
+        this.cdf.offset('interintra', sizeContext),
+      )
+      if (interintra)
+        throw new Error('ts-avif: inter-intra compound prediction is not implemented')
+    }
+
+    if (this.hdr.isMotionModeSwitchable
+      && Math.min(bw4, bh4) >= 2
+      && !(b.globalMotion && !this.hdr.forceIntegerMv)
+      && this.hasOverlappableNeighbor(bx4, by4, w4, h4, haveTop, haveLeft)) {
+      const allowWarp = this.hdr.allowWarpedMotion && this.hasMatchingReference(b.ref0, bx4, by4, w4, h4, haveTop, haveLeft)
+      const motionMode = allowWarp
+        ? this.msac.decodeSymbol(this.cdf.data, this.cdf.offset('motion_mode', bs), 2)
+        : this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('obmc', bs))
+      if (motionMode === 1)
+        throw new Error('ts-avif: overlapped motion compensation is not implemented')
+      if (motionMode === 2)
+        throw new Error('ts-avif: local warped motion is not implemented')
+    }
+
     if (this.hdr.interpolationFilter === 4) {
       if (useSubpelFilter) {
         const comp = b.ref1 >= 0 ? 1 : 0
@@ -1114,6 +1151,52 @@ export class TileDecoder {
     if (haveTop) append(this.a, bx4)
     if (haveLeft) append(this.l, by4)
     return refs
+  }
+
+  private hasOverlappableNeighbor(
+    bx4: number,
+    by4: number,
+    w4: number,
+    h4: number,
+    haveTop: boolean,
+    haveLeft: boolean,
+  ): boolean {
+    if (haveTop) {
+      for (let x = 0; x < (w4 >> 1); x++) {
+        if (!this.a.intra[bx4 + x * 2 + 1]) return true
+      }
+    }
+    if (haveLeft) {
+      for (let y = 0; y < (h4 >> 1); y++) {
+        if (!this.l.intra[by4 + y * 2 + 1]) return true
+      }
+    }
+    return false
+  }
+
+  private hasMatchingReference(
+    ref: number,
+    bx4: number,
+    by4: number,
+    w4: number,
+    h4: number,
+    haveTop: boolean,
+    haveLeft: boolean,
+  ): boolean {
+    const matches = (ctx: BlockContext, off: number): boolean => !ctx.intra[off]
+      && ctx.ref0[off] === ref
+      && !ctx.compType[off]
+    if (haveTop) {
+      for (let x = 0; x < w4; x++) {
+        if (matches(this.a, bx4 + x)) return true
+      }
+    }
+    if (haveLeft) {
+      for (let y = 0; y < h4; y++) {
+        if (matches(this.l, by4 + y)) return true
+      }
+    }
+    return false
   }
 
   private compContext(bx4: number, by4: number, haveTop: boolean, haveLeft: boolean): number {
