@@ -25,6 +25,7 @@ import {
 } from './consts'
 import { SymbolDecoder } from './msac'
 import { DQ_TBL_10BPC, DQ_TBL_12BPC } from './dequant-highbd'
+import { getQuantMatrix } from './quant-matrices'
 import {
   AL_PART_CTX,
   BLOCK_DIMENSIONS,
@@ -1167,11 +1168,16 @@ export class TileDecoder {
       rc = 0
     }
 
-    if (hdr.quantization.usingQMatrix)
-      throw new Error('ts-avif: quantizer matrices are not supported yet')
-
     // dequant
     const dqTbl = this.dq[b.segId][plane]
+    const qmLevel = plane === 0
+      ? hdr.quantization.qmY
+      : plane === 1
+        ? hdr.quantization.qmU
+        : hdr.quantization.qmV
+    const qm = hdr.quantization.usingQMatrix && !lossless && txtp < TxfmType.IDTX
+      ? getQuantMatrix(qmLevel, plane, tx)
+      : null
     const dqShift = Math.max(0, tDim.ctx - 2)
     const cfMax = (1 << (this.seq.bitDepth + 7)) - 1
     let culLevel: number
@@ -1185,6 +1191,8 @@ export class TileDecoder {
       const dcSignCtx = this.getDcSignCtx(tDim, aArr, aOff, lArr, lOff)
       const dcSign = msac.decodeBoolAdapt(cdf.data, cdf.offset('dc_sign', chroma, dcSignCtx))
       let dcDq = dqTbl[0]
+      if (qm)
+        dcDq = (dcDq * qm[0] + 16) >> 5
       dcSignLevel = dcSign ? 0 : 2 << 6
 
       if (dcTok === 15) {
@@ -1194,6 +1202,8 @@ export class TileDecoder {
       }
       else {
         dcDq = (dcDq * dcTok) >> dqShift
+        if (qm)
+          dcDq = Math.min(dcDq, cfMax + dcSign)
       }
       culLevel = dcTok
       cf[0] = dcSign ? -dcDq : dcDq
@@ -1206,14 +1216,17 @@ export class TileDecoder {
         const rcTok = cf[rc]
         let tok: number
         let dq: number
+        const weightedDq = qm ? (acDq * qm[rc] + 16) >> 5 : acDq
         if (rcTok >= (15 << 11)) {
           tok = (msac.readGolomb() + 15) & 0xFFFFF
-          dq = ((acDq * tok) & 0xFFFFFF) >> dqShift
+          dq = ((weightedDq * tok) & 0xFFFFFF) >> dqShift
           dq = Math.min(dq, cfMax + sign)
         }
         else {
           tok = rcTok >> 11
-          dq = (acDq * tok) >> dqShift
+          dq = (weightedDq * tok) >> dqShift
+          if (qm)
+            dq = Math.min(dq, cfMax + sign)
         }
         culLevel += tok
         cf[rc] = sign ? -dq : dq
