@@ -11,6 +11,7 @@ import { TileDecoder } from './decode-tile'
 import { INTRA_EDGE_TREE } from './intra-edge'
 import { applyLoopFilter, computeLoopFilterLevels, LoopFilterData } from './loopfilter'
 import { FrameBuffers, PixelReconstructor } from './recon'
+import { applyRestoration, RestorationInfo } from './restoration'
 
 export interface DecodedFrame {
   buf: FrameBuffers
@@ -34,6 +35,7 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
   }
   const cdefActive = seq.enableCdef
   const cdefData = cdefActive ? new CdefData(hdr.miCols, hdr.miRows) : null
+  const restorationInfo = seq.enableRestoration ? new RestorationInfo(seq, hdr) : null
   const sbRoot = INTRA_EDGE_TREE[seq.use128x128Superblock ? 0 : 1]
 
   const { tileCols, tileRows, miColStarts, miRowStarts } = hdr.tileInfo
@@ -47,11 +49,19 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     dec.rowStart = miRowStarts[tile.tileRow]
     dec.rowEnd = Math.min(miRowStarts[tile.tileRow + 1], hdr.miRows)
     dec.cdefData = cdefData
+    dec.restoration = restorationInfo
     dec.decodeTile(sbRoot)
   }
 
   if (recon.lf)
     applyLoopFilter(buf, recon.lf, seq, hdr)
+
+  // Loop restoration reads stripe boundaries from the deblocked (pre-CDEF)
+  // planes, so snapshot them before CDEF runs.
+  const lrActive = restorationInfo !== null && restorationInfo.restorePlanes !== 0
+  const deblocked = lrActive
+    ? { y: buf.y.slice(), u: buf.u.slice(), v: buf.v.slice() }
+    : null
 
   if (cdefData) {
     applyCdef(buf, cdefData, {
@@ -68,6 +78,9 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
       layout: seq.monochrome ? 0 : seq.subsamplingX === 0 ? 3 : seq.subsamplingY === 0 ? 2 : 1,
     })
   }
+
+  if (lrActive && deblocked)
+    applyRestoration(buf, restorationInfo!, seq, hdr, deblocked)
 
   return { buf, width: hdr.frameWidth, height: hdr.frameHeight }
 }
