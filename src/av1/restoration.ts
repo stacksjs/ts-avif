@@ -6,6 +6,7 @@
  */
 import type { CdfContext } from './cdf'
 import type { FrameHeader } from './frame-header'
+import type { PixelPlane } from './pixels'
 import type { SequenceHeader } from './sequence'
 import type { SymbolDecoder } from './msac'
 import { decodeSubexp } from './msac'
@@ -227,11 +228,19 @@ function box5RowV(sqP: Row[], smP: Row[], sqO: Row, smO: Row, w: number): void {
   }
 }
 
-function calcRowAB(AA: Row, BB: Row, w: number, s: number, n: number, oneByX: number): void {
-  // 8-bit: bitdepth_min_8 == 0, so the a/b down-shifts are no-ops.
+function calcRowAB(
+  AA: Row,
+  BB: Row,
+  w: number,
+  s: number,
+  n: number,
+  oneByX: number,
+  bitDepth: number,
+): void {
+  const depthShift = bitDepth - 8
   for (let i = 0; i < w + 2; i++) {
-    const a = AA[i]
-    const b = BB[i]
+    const a = (AA[i] + ((1 << (2 * depthShift)) >> 1)) >> (2 * depthShift)
+    const b = (BB[i] + ((1 << depthShift) >> 1)) >> depthShift
     const p = Math.max(a * n - b * b, 0)
     const z = (p * s + (1 << 19)) >>> 20 // unsigned; p*s < 2^32
     const x = SGR_X_BY_X[z < 255 ? z : 255]
@@ -266,21 +275,32 @@ function rotate5x2(a: Row[], b: Row[]): void {
   b[4] = b1
 }
 
-function box3Vert(sqP: Row[], smP: Row[], AA: Row, BB: Row, w: number, s: number): void {
+function box3Vert(sqP: Row[], smP: Row[], AA: Row, BB: Row, w: number, s: number, bitDepth: number): void {
   box3RowV(sqP, smP, AA, BB, w)
-  calcRowAB(AA, BB, w, s, 9, 455)
+  calcRowAB(AA, BB, w, s, 9, 455, bitDepth)
   rotate(sqP, smP, 3)
 }
 
-function box5Vert(sqP: Row[], smP: Row[], AA: Row, BB: Row, w: number, s: number): void {
+function box5Vert(sqP: Row[], smP: Row[], AA: Row, BB: Row, w: number, s: number, bitDepth: number): void {
   box5RowV(sqP, smP, AA, BB, w)
-  calcRowAB(AA, BB, w, s, 25, 164)
+  calcRowAB(AA, BB, w, s, 25, 164, bitDepth)
   rotate5x2(sqP, smP)
 }
 
-function box3HV(sqP: Row[], smP: Row[], AA: Row, BB: Row, left: LeftFn, src: SrcFn, w: number, s: number, edges: number): void {
+function box3HV(
+  sqP: Row[],
+  smP: Row[],
+  AA: Row,
+  BB: Row,
+  left: LeftFn,
+  src: SrcFn,
+  w: number,
+  s: number,
+  edges: number,
+  bitDepth: number,
+): void {
   box3RowH(sqP[2], smP[2], left, src, w, edges)
-  box3Vert(sqP, smP, AA, BB, w, s)
+  box3Vert(sqP, smP, AA, BB, w, s, bitDepth)
 }
 
 // --- SGR finishing filters ---
@@ -326,9 +346,9 @@ function filterRow2(AP: Row[], BP: Row[], w: number, h: number, dst: Int32Array,
 // --- Per-unit SGR drivers ---
 
 interface SgrCtx {
-  cur: Uint8Array
-  buf: Uint8Array
-  deb: Uint8Array
+  cur: PixelPlane
+  buf: PixelPlane
+  deb: PixelPlane
   stride: number
   dstride: number
   ux: number
@@ -337,6 +357,7 @@ interface SgrCtx {
   w: number
   h: number
   edges: number
+  bitDepth: number
 }
 
 function makeAccessors(ctx: SgrCtx) {
@@ -362,7 +383,7 @@ function weightedRow1(ctx: SgrCtx, row: number, t: Int32Array, off: number, weig
   const base = row * stride + ux
   for (let i = 0; i < w; i++) {
     const v = weight * t[off + i]
-    buf[base + i] = iclip(cur[base + i] + ((v + (1 << 10)) >> 11), 0, 255)
+    buf[base + i] = iclip(cur[base + i] + ((v + (1 << 10)) >> 11), 0, (1 << ctx.bitDepth) - 1)
   }
 }
 
@@ -372,7 +393,7 @@ function weighted2(ctx: SgrCtx, row: number, h: number, t5: Int32Array, t3: Int3
     const base = (row + jr) * stride + ux
     for (let i = 0; i < w; i++) {
       const v = w0 * t5[jr * FOUT + i] + w1 * t3[jr * FOUT + i]
-      buf[base + i] = iclip(cur[base + i] + ((v + (1 << 10)) >> 11), 0, 255)
+      buf[base + i] = iclip(cur[base + i] + ((v + (1 << 10)) >> 11), 0, (1 << ctx.bitDepth) - 1)
     }
   }
 }
@@ -409,7 +430,7 @@ function sgr3x3(ctx: SgrCtx, s: number, w1: number): void {
   const vert = (): void => {
     sqP[2] = sqP[1]
     smP[2] = smP[1]
-    box3Vert(sqP, smP, AP[2], BP[2], w, s)
+    box3Vert(sqP, smP, AP[2], BP[2], w, s, ctx.bitDepth)
   }
   const bh = ctx.edges & LR_HAVE_BOTTOM
   const lb = Y + ctx.h
@@ -417,11 +438,11 @@ function sgr3x3(ctx: SgrCtx, s: number, w1: number): void {
   if (ctx.edges & LR_HAVE_TOP) {
     box3RowH(sqRows[0], smRows[0], null, acc.topSrc(Y - 2), w, ctx.edges)
     box3RowH(sqRows[1], smRows[1], null, acc.topSrc(Y - 1), w, ctx.edges)
-    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges)
+    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges, ctx.bitDepth)
     jj++
     rotate(AP, BP, 3)
     if (--h <= 0) { vert(); rotate(AP, BP, 3); vert(); finish1Src(); return }
-    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges)
+    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges, ctx.bitDepth)
     jj++
     rotate(AP, BP, 3)
     if (--h <= 0) { vert(); finish1Src(); vert(); finish1Src(); return }
@@ -435,12 +456,12 @@ function sgr3x3(ctx: SgrCtx, s: number, w1: number): void {
     smP[2] = smRows[0]
     box3RowH(sqRows[0], smRows[0], acc.intLeft(jj), acc.intSrc(jj), w, ctx.edges)
     jj++
-    box3Vert(sqP, smP, AP[2], BP[2], w, s)
+    box3Vert(sqP, smP, AP[2], BP[2], w, s, ctx.bitDepth)
     rotate(AP, BP, 3)
     if (--h <= 0) { vert(); rotate(AP, BP, 3); vert(); finish1Src(); return }
     sqP[2] = sqRows[1]
     smP[2] = smRows[1]
-    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges)
+    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges, ctx.bitDepth)
     jj++
     rotate(AP, BP, 3)
     if (--h <= 0) { vert(); finish1Src(); vert(); finish1Src(); return }
@@ -449,16 +470,16 @@ function sgr3x3(ctx: SgrCtx, s: number, w1: number): void {
   }
 
   do {
-    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges)
+    box3HV(sqP, smP, AP[2], BP[2], acc.intLeft(jj), acc.intSrc(jj), w, s, ctx.edges, ctx.bitDepth)
     jj++
     finish1Src()
   } while (--h > 0)
 
   if (!bh) { vert(); finish1Src(); vert(); finish1Src(); return }
 
-  box3HV(sqP, smP, AP[2], BP[2], null, acc.topSrc(lb), w, s, ctx.edges)
+  box3HV(sqP, smP, AP[2], BP[2], null, acc.topSrc(lb), w, s, ctx.edges, ctx.bitDepth)
   finish1Src()
-  box3HV(sqP, smP, AP[2], BP[2], null, acc.topSrc(lb + 1), w, s, ctx.edges)
+  box3HV(sqP, smP, AP[2], BP[2], null, acc.topSrc(lb + 1), w, s, ctx.edges, ctx.bitDepth)
   finish1Src()
 }
 
@@ -499,7 +520,7 @@ function sgr5x5(ctx: SgrCtx, s: number, w0: number): void {
     sqP[4] = sqP[2]
     smP[3] = smP[2]
     smP[4] = smP[2]
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     finish2(2)
   }
   const output1 = (): void => {
@@ -507,20 +528,20 @@ function sgr5x5(ctx: SgrCtx, s: number, w0: number): void {
     sqP[4] = sqP[2]
     smP[3] = smP[2]
     smP[4] = smP[2]
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     finish2(1)
   }
   const odd = (): void => {
     sqP[4] = sqP[3]
     smP[4] = smP[3]
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     finish2(2)
     output1()
   }
   const vert1 = (): void => {
     sqP[4] = sqP[3]
     smP[4] = smP[3]
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     rotate(AP, BP, 2)
     output1()
   }
@@ -535,7 +556,7 @@ function sgr5x5(ctx: SgrCtx, s: number, w0: number): void {
     if (--h <= 0) { vert1(); return }
     box5RowH(sqRows[3], smRows[3], acc.intLeft(jj), acc.intSrc(jj), w, ctx.edges)
     jj++
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     rotate(AP, BP, 2)
     if (--h <= 0) { vert2(); return }
     sqP[3] = sqRows[4]
@@ -550,7 +571,7 @@ function sgr5x5(ctx: SgrCtx, s: number, w0: number): void {
     smP[4] = smRows[1]
     box5RowH(sqRows[1], smRows[1], acc.intLeft(jj), acc.intSrc(jj), w, ctx.edges)
     jj++
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     rotate(AP, BP, 2)
     if (--h <= 0) { vert2(); return }
     sqP[3] = sqRows[2]; sqP[4] = sqRows[3]
@@ -560,7 +581,7 @@ function sgr5x5(ctx: SgrCtx, s: number, w0: number): void {
     if (--h <= 0) { odd(); return }
     box5RowH(sqRows[3], smRows[3], acc.intLeft(jj), acc.intSrc(jj), w, ctx.edges)
     jj++
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     finish2(2)
     if (--h <= 0) { vert2(); return }
     sqP[3] = sqRows[4]
@@ -573,7 +594,7 @@ function sgr5x5(ctx: SgrCtx, s: number, w0: number): void {
     if (--h <= 0) { odd(); return }
     boxh(4, acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box5Vert(sqP, smP, AP[1], BP[1], w, s)
+    box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
     finish2(2)
     if (--h <= 0)
       break
@@ -582,7 +603,7 @@ function sgr5x5(ctx: SgrCtx, s: number, w0: number): void {
   if (!bh) { vert2(); return }
   boxh(3, null, acc.topSrc(lb))
   boxh(4, null, acc.topSrc(lb + 1))
-  box5Vert(sqP, smP, AP[1], BP[1], w, s)
+  box5Vert(sqP, smP, AP[1], BP[1], w, s, ctx.bitDepth)
   finish2(2)
 }
 
@@ -636,41 +657,41 @@ function sgrMix(ctx: SgrCtx, s0: number, s1: number, w0: number, w1: number): vo
   const vert2 = (): void => {
     sq5P[3] = sq5P[2]; sq5P[4] = sq5P[2]; sm5P[3] = sm5P[2]; sm5P[4] = sm5P[2]
     sq3P[2] = sq3P[1]; sm3P[2] = sm3P[1]
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     sq3P[2] = sq3P[1]; sm3P[2] = sm3P[1]
     // output_2:
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     finishMix(2)
   }
   const output2 = (): void => {
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     finishMix(2)
   }
   const output1 = (): void => {
     sq5P[3] = sq5P[2]; sq5P[4] = sq5P[2]; sm5P[3] = sm5P[2]; sm5P[4] = sm5P[2]
     sq3P[2] = sq3P[1]; sm3P[2] = sm3P[1]
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     finishMix(1)
   }
   const odd = (): void => {
     sq5P[4] = sq5P[3]; sm5P[4] = sm5P[3]
     sq3P[2] = sq3P[1]; sm3P[2] = sm3P[1]
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     finishMix(2)
     output1()
   }
   const vert1 = (): void => {
     sq5P[4] = sq5P[3]; sm5P[4] = sm5P[3]
     sq3P[2] = sq3P[1]; sm3P[2] = sm3P[1]
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
     rotate(A5P, B5P, 2)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     output1()
   }
@@ -684,14 +705,14 @@ function sgrMix(ctx: SgrCtx, s0: number, s1: number, w0: number, w1: number): vo
     box35(sq3Rows[1], sm3Rows[1], sq5Rows[1], sm5Rows[1], null, acc.topSrc(Y - 1))
     box35(sq3Rows[2], sm3Rows[2], sq5Rows[2], sm5Rows[2], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     if (--h <= 0) { vert1(); return }
     box35(sq3P[2], sm3P[2], sq5Rows[3], sm5Rows[3], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
     rotate(A5P, B5P, 2)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     if (--h <= 0) { vert2(); return }
     sq5P[3] = sq5Rows[4]
@@ -703,7 +724,7 @@ function sgrMix(ctx: SgrCtx, s0: number, s1: number, w0: number, w1: number): vo
     sm3P[0] = sm3Rows[0]; sm3P[1] = sm3Rows[0]; sm3P[2] = sm3Rows[0]
     box35(sq3Rows[0], sm3Rows[0], sq5Rows[0], sm5Rows[0], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     if (--h <= 0) { vert1(); return }
     sq5P[4] = sq5Rows[1]
@@ -712,9 +733,9 @@ function sgrMix(ctx: SgrCtx, s0: number, s1: number, w0: number, w1: number): vo
     sm3P[2] = sm3Rows[1]
     box35(sq3Rows[1], sm3Rows[1], sq5Rows[1], sm5Rows[1], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
     rotate(A5P, B5P, 2)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     if (--h <= 0) { vert2(); return }
     sq5P[3] = sq5Rows[2]; sq5P[4] = sq5Rows[3]
@@ -723,13 +744,13 @@ function sgrMix(ctx: SgrCtx, s0: number, s1: number, w0: number, w1: number): vo
     sm3P[2] = sm3Rows[2]
     box35(sq3Rows[2], sm3Rows[2], sq5Rows[2], sm5Rows[2], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     if (--h <= 0) { odd(); return }
     box35(sq3P[2], sm3P[2], sq5Rows[3], sm5Rows[3], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     finishMix(2)
     if (--h <= 0) { vert2(); return }
     sq5P[3] = sq5Rows[4]
@@ -739,13 +760,13 @@ function sgrMix(ctx: SgrCtx, s0: number, s1: number, w0: number, w1: number): vo
   for (;;) {
     box35(sq3P[2], sm3P[2], sq5P[3], sm5P[3], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     rotate(A3P, B3P, 4)
     if (--h <= 0) { odd(); return }
     box35(sq3P[2], sm3P[2], sq5P[4], sm5P[4], acc.intLeft(jj), acc.intSrc(jj))
     jj++
-    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0)
-    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+    box5Vert(sq5P, sm5P, A5P[1], B5P[1], w, s0, ctx.bitDepth)
+    box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
     finishMix(2)
     if (--h <= 0)
       break
@@ -753,7 +774,7 @@ function sgrMix(ctx: SgrCtx, s0: number, s1: number, w0: number, w1: number): vo
 
   if (!bh) { vert2(); return }
   box35(sq3P[2], sm3P[2], sq5P[3], sm5P[3], null, acc.topSrc(lb))
-  box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1)
+  box3Vert(sq3P, sm3P, A3P[3], B3P[3], w, s1, ctx.bitDepth)
   rotate(A3P, B3P, 4)
   box35(sq3P[2], sm3P[2], sq5P[4], sm5P[4], null, acc.topSrc(lb + 1))
   output2()
@@ -780,11 +801,11 @@ function processUnit(ctx: SgrCtx, unit: LrUnit): void {
 }
 
 export function applyRestoration(
-  postCdef: { y: Uint8Array, u: Uint8Array, v: Uint8Array, yStride: number, uvStride: number },
+  postCdef: { y: PixelPlane, u: PixelPlane, v: PixelPlane, yStride: number, uvStride: number },
   info: RestorationInfo,
   seq: SequenceHeader,
   hdr: FrameHeader,
-  deblocked: { y: Uint8Array, u: Uint8Array, v: Uint8Array },
+  deblocked: { y: PixelPlane, u: PixelPlane, v: PixelPlane },
 ): void {
   const sb128 = seq.use128x128Superblock ? 1 : 0
   const W = hdr.frameWidth
@@ -843,6 +864,7 @@ export function applyRestoration(
           const e2 = haveBottom ? (e | LR_HAVE_BOTTOM) : (e & ~LR_HAVE_BOTTOM)
           const ctx: SgrCtx = {
             cur, buf, deb, stride, dstride: stride, ux: xx, Y: y, ph, w: unitW, h: stripeH, edges: e2,
+            bitDepth: seq.bitDepth,
           }
           processUnit(ctx, u)
           y += stripeH
@@ -887,6 +909,15 @@ function wienerUnit(ctx: SgrCtx, unit: LrUnit): void {
   const fv2 = unit.filterV[2]
   const fh = [fh0, fh1, fh2, -(fh0 + fh1 + fh2) * 2, fh2, fh1, fh0]
   const fv = [fv0, fv1, fv2, 128 - (fv0 + fv1 + fv2) * 2, fv2, fv1, fv0]
+  const bitDepth = ctx.bitDepth
+  const roundBitsH = 3 + (bitDepth === 12 ? 2 : 0)
+  const roundBitsV = 11 - (bitDepth === 12 ? 2 : 0)
+  const roundingOffH = 1 << (roundBitsH - 1)
+  const roundingOffV = 1 << (roundBitsV - 1)
+  const horizontalOffset = 1 << (bitDepth + 6)
+  const horizontalLimit = (1 << (bitDepth + 8 - roundBitsH)) - 1
+  const verticalOffset = 1 << (bitDepth + roundBitsV - 1)
+  const pixelMax = (1 << bitDepth) - 1
   const P = REST_STRIDE
   const hl = edges & LR_HAVE_LEFT ? 1 : 0
   const hr = edges & LR_HAVE_RIGHT ? 1 : 0
@@ -899,7 +930,9 @@ function wienerUnit(ctx: SgrCtx, unit: LrUnit): void {
   const curAt = (row: number, col: number): number => cur[row * stride + ux + col]
   const debAt = (row: number, col: number): number => deb[clampRow(row) * stride + ux + col]
   const leftAt = (j: number, k: number): number => cur[(Y + j) * stride + ux - 4 + k]
-  const tmp = new Uint8Array((h + 6) * P)
+  const tmp: PixelPlane = cur instanceof Uint16Array
+    ? new Uint16Array((h + 6) * P)
+    : new Uint8Array((h + 6) * P)
 
   for (let k = 0; k < unitW; k++) {
     const col = pCol0 + k
@@ -983,20 +1016,20 @@ function wienerUnit(ctx: SgrCtx, unit: LrUnit): void {
   for (let j = 0; j < h + 6; j++) {
     const rr = j * P
     for (let i = 0; i < w; i++) {
-      let sum = (1 << 14) + tmp[rr + i + 3] * 128
+      let sum = horizontalOffset + (bitDepth === 8 ? tmp[rr + i + 3] * 128 : 0)
       sum += tmp[rr + i] * fh[0] + tmp[rr + i + 1] * fh[1] + tmp[rr + i + 2] * fh[2]
         + tmp[rr + i + 3] * fh[3] + tmp[rr + i + 4] * fh[4] + tmp[rr + i + 5] * fh[5] + tmp[rr + i + 6] * fh[6]
-      hor[rr + i] = iclip((sum + 4) >> 3, 0, 8191)
+      hor[rr + i] = iclip((sum + roundingOffH) >> roundBitsH, 0, horizontalLimit)
     }
   }
   for (let j = 0; j < h; j++) {
     const base = (Y + j) * stride + ux
     for (let i = 0; i < w; i++) {
-      let sum = -(1 << 18)
+      let sum = -verticalOffset
       sum += hor[j * P + i] * fv[0] + hor[(j + 1) * P + i] * fv[1] + hor[(j + 2) * P + i] * fv[2]
         + hor[(j + 3) * P + i] * fv[3] + hor[(j + 4) * P + i] * fv[4] + hor[(j + 5) * P + i] * fv[5]
         + hor[(j + 6) * P + i] * fv[6]
-      buf[base + i] = iclip((sum + 1024) >> 11, 0, 255)
+      buf[base + i] = iclip((sum + roundingOffV) >> roundBitsV, 0, pixelMax)
     }
   }
 }

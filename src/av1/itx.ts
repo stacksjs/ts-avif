@@ -7,6 +7,8 @@
  */
 import { TxfmType } from './consts'
 import { TXFM_INFO } from './decode-tile'
+import type { PixelPlane } from './pixels'
+import { bitDepthMax } from './pixels'
 import { SCANS } from './tables'
 
 // 1D transform types, matching dav1d itx_1d.h enum Tx1dType
@@ -46,8 +48,8 @@ function iclip(v: number, min: number, max: number): number {
   return v < min ? min : v > max ? max : v
 }
 
-function clipPixel(v: number): number {
-  return v < 0 ? 0 : v > 255 ? 255 : v
+function clipPixel(v: number, max: number): number {
+  return v < 0 ? 0 : v > max ? max : v
 }
 
 // DCT family (inv_dct4/8/16/32/64_1d_c); the tx64 flag means only the low
@@ -1027,7 +1029,13 @@ for (let tx = 0; tx < 19; tx++) {
 
 const TMP = new Int32Array(64 * 64)
 
-function invTxfmAddWht4x4(dst: Uint8Array, dstOff: number, stride: number, cf: Int32Array): void {
+function invTxfmAddWht4x4(
+  dst: PixelPlane,
+  dstOff: number,
+  stride: number,
+  cf: Int32Array,
+  max: number,
+): void {
   for (let y = 0; y < 4; y++) {
     for (let x = 0; x < 4; x++)
       TMP[y * 4 + x] = cf[y + x * 4] >> 2
@@ -1040,7 +1048,7 @@ function invTxfmAddWht4x4(dst: Uint8Array, dstOff: number, stride: number, cf: I
 
   for (let y = 0; y < 4; y++)
     for (let x = 0; x < 4; x++)
-      dst[dstOff + y * stride + x] = clipPixel(dst[dstOff + y * stride + x] + TMP[y * 4 + x])
+      dst[dstOff + y * stride + x] = clipPixel(dst[dstOff + y * stride + x] + TMP[y * 4 + x], max)
 }
 
 /**
@@ -1049,16 +1057,18 @@ function invTxfmAddWht4x4(dst: Uint8Array, dstOff: number, stride: number, cf: I
  * Zeroes the consumed region of `cf` (same contract as dav1d).
  */
 export function itxfmAdd(
-  dst: Uint8Array,
+  dst: PixelPlane,
   dstOff: number,
   stride: number,
   cf: Int32Array,
   tx: number,
   txtp: number,
   eob: number,
+  bitDepth = 8,
 ): void {
+  const max = bitDepthMax(bitDepth)
   if (txtp === TxfmType.WHT_WHT) {
-    invTxfmAddWht4x4(dst, dstOff, stride, cf)
+    invTxfmAddWht4x4(dst, dstOff, stride, cf, max)
     return
   }
 
@@ -1080,7 +1090,7 @@ export function itxfmAdd(
     dc = (dc * 181 + 128 + 2048) >> 12
     for (let y = 0; y < h; y++)
       for (let x = 0; x < w; x++)
-        dst[dstOff + y * stride + x] = clipPixel(dst[dstOff + y * stride + x] + dc)
+        dst[dstOff + y * stride + x] = clipPixel(dst[dstOff + y * stride + x] + dc, max)
     return
   }
 
@@ -1092,9 +1102,10 @@ export function itxfmAdd(
     throw new Error(`itxfmAdd: no 1D transform for tx=${tx} txtp=${txtp}`)
   const sh = Math.min(h, 32)
   const sw = Math.min(w, 32)
-  // 8bpc row and column intermediates clip to int16
-  const clipMin = -32768
-  const clipMax = 32767
+  const rowClipMin = bitDepth === 8 ? -32768 : (~max) << 7
+  const rowClipMax = ~rowClipMin
+  const colClipMin = bitDepth === 8 ? -32768 : (~max) << 5
+  const colClipMax = ~colClipMin
 
   let lastNonzeroCol: number
   if (secondType === IDENTITY && firstType !== IDENTITY)
@@ -1114,19 +1125,19 @@ export function itxfmAdd(
       for (let x = 0; x < sw; x++)
         TMP[c + x] = cf[y + x * sh]
     }
-    first1dFn(TMP, c, 1, clipMin, clipMax)
+    first1dFn(TMP, c, 1, rowClipMin, rowClipMax)
   }
   if (lastNonzeroCol + 1 < sh)
     TMP.fill(0, c, sh * w)
 
   cf.fill(0, 0, sw * sh)
   for (let i = 0; i < w * sh; i++)
-    TMP[i] = iclip((TMP[i] + rnd) >> shift, clipMin, clipMax)
+    TMP[i] = iclip((TMP[i] + rnd) >> shift, colClipMin, colClipMax)
 
   for (let x = 0; x < w; x++)
-    second1dFn(TMP, x, w, clipMin, clipMax)
+    second1dFn(TMP, x, w, colClipMin, colClipMax)
 
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++)
-      dst[dstOff + y * stride + x] = clipPixel(dst[dstOff + y * stride + x] + ((TMP[y * w + x] + 8) >> 4))
+      dst[dstOff + y * stride + x] = clipPixel(dst[dstOff + y * stride + x] + ((TMP[y * w + x] + 8) >> 4), max)
 }

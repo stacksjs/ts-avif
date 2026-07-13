@@ -24,6 +24,7 @@ import {
   TxfmType,
 } from './consts'
 import { SymbolDecoder } from './msac'
+import { DQ_TBL_10BPC, DQ_TBL_12BPC } from './dequant-highbd'
 import {
   AL_PART_CTX,
   BLOCK_DIMENSIONS,
@@ -217,8 +218,6 @@ export class TileDecoder {
     cdf: CdfContext,
     recon: Reconstructor | null = null,
   ) {
-    if (seq.bitDepth !== 8)
-      throw new Error('ts-avif: only 8-bit AV1 streams are supported so far')
     this.msac = new SymbolDecoder(tileData, hdr.disableCdfUpdate)
     this.cdf = cdf
     this.recon = recon
@@ -236,7 +235,7 @@ export class TileDecoder {
 
     this.frameDq = []
     for (let seg = 0; seg < 8; seg++)
-      this.frameDq.push(computeDq(hdr, hdr.segQIndex[seg]))
+      this.frameDq.push(computeDq(seq.bitDepth, hdr, hdr.segQIndex[seg]))
     this.dq = this.frameDq
     this.lastQIdx = hdr.quantization.baseQIdx
 
@@ -555,7 +554,7 @@ export class TileDecoder {
         else {
           this.dq = []
           for (let s = 0; s < 8; s++)
-            this.dq.push(computeDq(hdr, this.lastQIdx))
+            this.dq.push(computeDq(this.seq.bitDepth, hdr, this.lastQIdx))
         }
       }
     }
@@ -1163,7 +1162,7 @@ export class TileDecoder {
     // dequant
     const dqTbl = this.dq[b.segId][plane]
     const dqShift = Math.max(0, tDim.ctx - 2)
-    const cfMax = 32767 // 8bpc coef clamp, see dav1d cf_max
+    const cfMax = (1 << (this.seq.bitDepth + 7)) - 1
     let culLevel: number
     let dcSignLevel: number
 
@@ -1321,13 +1320,18 @@ function gatherLeftPartitionProb(data: Uint16Array, off: number, bl: BlockLevel)
   return out
 }
 
-function computeDq(hdr: FrameHeader, qidx: number): number[][] {
+function computeDq(bitDepth: number, hdr: FrameHeader, qidx: number): number[][] {
   const q = hdr.quantization
   const clip = (v: number): number => clamp(v, 0, 255)
+  const table = bitDepth === 12
+    ? DQ_TBL_12BPC
+    : bitDepth === 10
+      ? DQ_TBL_10BPC
+      : DQ_TBL_8BPC
   return [
-    [DQ_TBL_8BPC[clip(qidx + q.deltaQYDc) * 2], DQ_TBL_8BPC[qidx * 2 + 1]],
-    [DQ_TBL_8BPC[clip(qidx + q.deltaQUDc) * 2], DQ_TBL_8BPC[clip(qidx + q.deltaQUAc) * 2 + 1]],
-    [DQ_TBL_8BPC[clip(qidx + q.deltaQVDc) * 2], DQ_TBL_8BPC[clip(qidx + q.deltaQVAc) * 2 + 1]],
+    [table[clip(qidx + q.deltaQYDc) * 2], table[qidx * 2 + 1]],
+    [table[clip(qidx + q.deltaQUDc) * 2], table[clip(qidx + q.deltaQUAc) * 2 + 1]],
+    [table[clip(qidx + q.deltaQVDc) * 2], table[clip(qidx + q.deltaQVAc) * 2 + 1]],
   ]
 }
 

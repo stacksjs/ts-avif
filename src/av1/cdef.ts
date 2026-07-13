@@ -3,6 +3,7 @@
  * dav1d's cdef_tmpl.c: the 8x8 direction search and the primary/secondary
  * constrained filter, plus a whole-frame driver. 8-bit only.
  */
+import type { PixelPlane } from './pixels'
 import { CDEF_DIRECTIONS } from './tables'
 
 export const CDEF_HAVE_LEFT = 1
@@ -36,14 +37,21 @@ const DIV_TABLE = [840, 420, 280, 210, 168, 140, 120]
  * Direction search over an 8x8 block. Returns the best direction (0..7) and
  * writes the variance into `varOut[0]`.
  */
-export function cdefFindDir(img: Uint8Array, off: number, stride: number, varOut: Int32Array): number {
+export function cdefFindDir(
+  img: PixelPlane,
+  off: number,
+  stride: number,
+  varOut: Int32Array,
+  bitDepth = 8,
+): number {
+  const shift = bitDepth - 8
   const psHv = [new Int32Array(8), new Int32Array(8)]
   const psDiag = [new Int32Array(15), new Int32Array(15)]
   const psAlt = [new Int32Array(11), new Int32Array(11), new Int32Array(11), new Int32Array(11)]
 
   for (let y = 0; y < 8; y++) {
     for (let x = 0; x < 8; x++) {
-      const px = img[off + y * stride + x] - 128
+      const px = (img[off + y * stride + x] >> shift) - 128
       psDiag[0][y + x] += px
       psAlt[0][y + (x >> 1)] += px
       psHv[0][y] += px
@@ -107,13 +115,13 @@ function fillSentinel(tmp: Int32Array, off: number, w: number, h: number): void 
 function padding(
   tmp: Int32Array,
   tmpBase: number,
-  src: Uint8Array,
+  src: PixelPlane,
   srcOff: number,
   srcStride: number,
   left: Int32Array,
-  top: Uint8Array,
+  top: PixelPlane,
   topOff: number,
-  bottom: Uint8Array,
+  bottom: PixelPlane,
   botOff: number,
   w: number,
   h: number,
@@ -171,13 +179,13 @@ function padding(
  * the left of each row; `top`/`bottom` point at the pre-filter neighbor rows.
  */
 export function cdefFilterBlock(
-  dst: Uint8Array,
+  dst: PixelPlane,
   dstOff: number,
   dstStride: number,
   left: Int32Array,
-  top: Uint8Array,
+  top: PixelPlane,
   topOff: number,
-  bottom: Uint8Array,
+  bottom: PixelPlane,
   botOff: number,
   priStrength: number,
   secStrength: number,
@@ -186,9 +194,10 @@ export function cdefFilterBlock(
   w: number,
   h: number,
   edges: number,
-  src: Uint8Array = dst,
+  src: PixelPlane = dst,
   srcOff: number = dstOff,
   srcStride: number = dstStride,
+  bitDepth = 8,
 ): void {
   const tmp = new Int32Array(TMP_STRIDE * (h + 4))
   const tmpBase = 2 * TMP_STRIDE + 2
@@ -197,7 +206,7 @@ export function cdefFilterBlock(
   const dirBase = dir // CDEF_DIRECTIONS is prefixed by 2 rows, so table[dir+2] is dir
 
   if (priStrength) {
-    const priTap = 4 - (priStrength & 1)
+    const priTap = 4 - ((priStrength >> (bitDepth - 8)) & 1)
     const priShift = Math.max(0, damping - ulog2(priStrength))
     if (secStrength) {
       const secShift = damping - ulog2(secStrength)
@@ -333,9 +342,9 @@ const UV_DIRS = [
 ]
 
 interface CdefPlanes {
-  y: Uint8Array
-  u: Uint8Array
-  v: Uint8Array
+  y: PixelPlane
+  u: PixelPlane
+  v: PixelPlane
   yStride: number
   uvStride: number
 }
@@ -360,13 +369,16 @@ export function applyCdef(
     ssHor: number
     ssVer: number
     layout: number
+    bitDepth?: number
   },
 ): void {
   if (!opts.enableCdef)
     return
   const miCols = data.miCols
   const miRows = data.miRows
-  const damping = opts.damping
+  const bitDepth = opts.bitDepth ?? 8
+  const depthShift = bitDepth - 8
+  const damping = opts.damping + depthShift
   const ssHor = opts.ssHor
   const ssVer = opts.ssVer
   const uvDir = UV_DIRS[opts.layout === 2 ? 1 : 0]
@@ -382,10 +394,10 @@ export function applyCdef(
       const cdefIdx = data.idx[sb64]
       if (cdefIdx === -1)
         continue
-      const yPri = opts.yPri[cdefIdx]
-      const ySec = opts.ySec[cdefIdx]
-      const uvPri = opts.uvPri[cdefIdx]
-      const uvSec = opts.uvSec[cdefIdx]
+      const yPri = opts.yPri[cdefIdx] << depthShift
+      const ySec = opts.ySec[cdefIdx] << depthShift
+      const uvPri = opts.uvPri[cdefIdx] << depthShift
+      const uvSec = opts.uvSec[cdefIdx] << depthShift
       if (!yPri && !ySec && !uvPri && !uvSec)
         continue
 
@@ -412,7 +424,7 @@ export function applyCdef(
 
       let dir = 0
       if (yPri || uvPri)
-        dir = cdefFindDir(preY, by * 4 * buf.yStride + bx * 4, buf.yStride, varOut)
+        dir = cdefFindDir(preY, by * 4 * buf.yStride + bx * 4, buf.yStride, varOut, bitDepth)
 
       // luma
       if (yPri || ySec) {
@@ -431,7 +443,7 @@ export function applyCdef(
         if (yPri ? (adj || ySec) : ySec) {
           cdefFilterBlock(
             buf.y, dstOff, stride, left, preY, topOff, preY, botOff,
-            adj, ySec, dir, damping, 8, 8, edges, preY, dstOff, stride,
+            adj, ySec, dir, damping, 8, 8, edges, preY, dstOff, stride, bitDepth,
           )
         }
       }
@@ -459,7 +471,7 @@ export function applyCdef(
           const botOff = (cby + ch) * stride + cbx
           cdefFilterBlock(
             plane, dstOff, stride, left, pre, topOff, pre, botOff,
-            uvPri, uvSec, uvdir, damping - 1, cw, ch, edges, pre, dstOff, stride,
+            uvPri, uvSec, uvdir, damping - 1, cw, ch, edges, pre, dstOff, stride, bitDepth,
           )
         }
       }

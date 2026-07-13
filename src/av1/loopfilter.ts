@@ -6,6 +6,7 @@
  * horizontal edges, over the whole frame.
  */
 import type { FrameHeader } from './frame-header'
+import type { PixelPlane } from './pixels'
 import type { SequenceHeader } from './sequence'
 import type { FrameBuffers } from './recon'
 import { clamp } from './bits'
@@ -32,8 +33,8 @@ export function calcFilterLut(sharpness: number): FilterLut {
   return { e, i }
 }
 
-function clipPixel(v: number): number {
-  return v < 0 ? 0 : v > 255 ? 255 : v
+function clipPixel(v: number, max: number): number {
+  return v < 0 ? 0 : v > max ? max : v
 }
 
 /**
@@ -42,7 +43,7 @@ function clipPixel(v: number): number {
  * across it (p/q direction). `wd` is the filter width (4/6/8/16).
  */
 function loopFilterRun(
-  dst: Uint8Array,
+  dst: PixelPlane,
   off: number,
   E: number,
   I: number,
@@ -50,7 +51,16 @@ function loopFilterRun(
   sa: number,
   sb: number,
   wd: number,
+  bitDepth = 8,
 ): void {
+  const depthShift = bitDepth - 8
+  const F = 1 << depthShift
+  const max = (1 << bitDepth) - 1
+  const diffMin = -128 * F
+  const diffMax = 128 * F - 1
+  E <<= depthShift
+  I <<= depthShift
+  H <<= depthShift
   for (let n = 0; n < 4; n++, off += sa) {
     const p1 = dst[off + sb * -2]
     const p0 = dst[off + sb * -1]
@@ -91,16 +101,16 @@ function loopFilterRun(
       q4 = dst[off + sb * 4]
       q5 = dst[off + sb * 5]
       q6 = dst[off + sb * 6]
-      flat8out = Math.abs(p6 - p0) <= 1 && Math.abs(p5 - p0) <= 1
-        && Math.abs(p4 - p0) <= 1 && Math.abs(q4 - q0) <= 1
-        && Math.abs(q5 - q0) <= 1 && Math.abs(q6 - q0) <= 1
+      flat8out = Math.abs(p6 - p0) <= F && Math.abs(p5 - p0) <= F
+        && Math.abs(p4 - p0) <= F && Math.abs(q4 - q0) <= F
+        && Math.abs(q5 - q0) <= F && Math.abs(q6 - q0) <= F
     }
     if (wd >= 6) {
-      flat8in = Math.abs(p2 - p0) <= 1 && Math.abs(p1 - p0) <= 1
-        && Math.abs(q1 - q0) <= 1 && Math.abs(q2 - q0) <= 1
+      flat8in = Math.abs(p2 - p0) <= F && Math.abs(p1 - p0) <= F
+        && Math.abs(q1 - q0) <= F && Math.abs(q2 - q0) <= F
     }
     if (wd >= 8)
-      flat8in = flat8in && Math.abs(p3 - p0) <= 1 && Math.abs(q3 - q0) <= 1
+      flat8in = flat8in && Math.abs(p3 - p0) <= F && Math.abs(q3 - q0) <= F
 
     if (wd >= 16 && flat8out && flat8in) {
       dst[off + sb * -6] = (p6 * 7 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + 8) >> 4
@@ -133,22 +143,22 @@ function loopFilterRun(
     else {
       const hev = Math.abs(p1 - p0) > H || Math.abs(q1 - q0) > H
       if (hev) {
-        let f = clamp(p1 - q1, -128, 127)
-        f = clamp(3 * (q0 - p0) + f, -128, 127)
-        const f1 = Math.min(f + 4, 127) >> 3
-        const f2 = Math.min(f + 3, 127) >> 3
-        dst[off + sb * -1] = clipPixel(p0 + f2)
-        dst[off] = clipPixel(q0 - f1)
+        let f = clamp(p1 - q1, diffMin, diffMax)
+        f = clamp(3 * (q0 - p0) + f, diffMin, diffMax)
+        const f1 = Math.min(f + 4, diffMax) >> 3
+        const f2 = Math.min(f + 3, diffMax) >> 3
+        dst[off + sb * -1] = clipPixel(p0 + f2, max)
+        dst[off] = clipPixel(q0 - f1, max)
       }
       else {
-        const f = clamp(3 * (q0 - p0), -128, 127)
-        const f1 = Math.min(f + 4, 127) >> 3
-        const f2 = Math.min(f + 3, 127) >> 3
-        dst[off + sb * -1] = clipPixel(p0 + f2)
-        dst[off] = clipPixel(q0 - f1)
+        const f = clamp(3 * (q0 - p0), diffMin, diffMax)
+        const f1 = Math.min(f + 4, diffMax) >> 3
+        const f2 = Math.min(f + 3, diffMax) >> 3
+        dst[off + sb * -1] = clipPixel(p0 + f2, max)
+        dst[off] = clipPixel(q0 - f1, max)
         const f3 = (f1 + 1) >> 1
-        dst[off + sb * -2] = clipPixel(p1 + f3)
-        dst[off + sb] = clipPixel(q1 - f3)
+        dst[off + sb * -2] = clipPixel(p1 + f3, max)
+        dst[off + sb] = clipPixel(q1 - f3, max)
       }
     }
   }
@@ -240,17 +250,17 @@ export function applyLoopFilter(
   const lut = calcFilterLut(lf.sharpness)
 
   // Luma: vertical edges (all), then horizontal.
-  filterPlane(buf.y, buf.yStride, data.miCols, data.miRows, data.lvlYV, data.lvlYH, data.txlwY, data.txlhY, data.stepVY, data.stepHY, lut, 2, false)
+  filterPlane(buf.y, buf.yStride, data.miCols, data.miRows, data.lvlYV, data.lvlYH, data.txlwY, data.txlhY, data.stepVY, data.stepHY, lut, 2, false, seq.bitDepth)
 
   if (seq.monochrome)
     return
 
-  filterPlane(buf.u, buf.uvStride, data.cCols, data.cRows, data.lvlU, data.lvlU, data.txlwUv, data.txlhUv, data.stepVUv, data.stepHUv, lut, 1, true)
-  filterPlane(buf.v, buf.uvStride, data.cCols, data.cRows, data.lvlV, data.lvlV, data.txlwUv, data.txlhUv, data.stepVUv, data.stepHUv, lut, 1, true)
+  filterPlane(buf.u, buf.uvStride, data.cCols, data.cRows, data.lvlU, data.lvlU, data.txlwUv, data.txlhUv, data.stepVUv, data.stepHUv, lut, 1, true, seq.bitDepth)
+  filterPlane(buf.v, buf.uvStride, data.cCols, data.cRows, data.lvlV, data.lvlV, data.txlwUv, data.txlhUv, data.stepVUv, data.stepHUv, lut, 1, true, seq.bitDepth)
 }
 
 function filterPlane(
-  plane: Uint8Array,
+  plane: PixelPlane,
   stride: number,
   cols: number,
   rows: number,
@@ -263,6 +273,7 @@ function filterPlane(
   lut: FilterLut,
   cap: number,
   chroma: boolean,
+  bitDepth: number,
 ): void {
   // vertical edges (between columns): iterate columns, then the rows of cells
   for (let x = 1; x < cols; x++) {
@@ -277,7 +288,7 @@ function filterPlane(
         continue
       const idx = Math.min(cap, Math.min(txlw[cell], txlw[cell - 1]))
       const wd = chroma ? 4 + 2 * idx : 4 << idx
-      loopFilterRun(plane, y * 4 * stride + x * 4, lut.e[L], lut.i[L], L >> 4, stride, 1, wd)
+      loopFilterRun(plane, y * 4 * stride + x * 4, lut.e[L], lut.i[L], L >> 4, stride, 1, wd, bitDepth)
     }
   }
   // horizontal edges (between rows)
@@ -293,7 +304,7 @@ function filterPlane(
         continue
       const idx = Math.min(cap, Math.min(txlh[cell], txlh[(y - 1) * cols + x]))
       const wd = chroma ? 4 + 2 * idx : 4 << idx
-      loopFilterRun(plane, y * 4 * stride + x * 4, lut.e[L], lut.i[L], L >> 4, 1, stride, wd)
+      loopFilterRun(plane, y * 4 * stride + x * 4, lut.e[L], lut.i[L], L >> 4, 1, stride, wd, bitDepth)
     }
   }
 }

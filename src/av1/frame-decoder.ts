@@ -5,6 +5,7 @@
 import type { FrameHeader } from './frame-header'
 import type { SequenceHeader } from './sequence'
 import type { Tile } from './tile-group'
+import type { PixelPlane } from './pixels'
 import { applyCdef, CdefData } from './cdef'
 import { CdfContext } from './cdf'
 import { TileDecoder } from './decode-tile'
@@ -26,6 +27,7 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     seq.subsamplingX,
     seq.subsamplingY,
     seq.monochrome,
+    seq.bitDepth,
   )
   const recon = new PixelReconstructor(buf, seq)
   const lfActive = hdr.loopFilter.levels[0] !== 0 || hdr.loopFilter.levels[1] !== 0
@@ -76,6 +78,7 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
       ssHor: seq.subsamplingX,
       ssVer: seq.subsamplingY,
       layout: seq.monochrome ? 0 : seq.subsamplingX === 0 ? 3 : seq.subsamplingY === 0 ? 2 : 1,
+      bitDepth: seq.bitDepth,
     })
   }
 
@@ -102,7 +105,7 @@ export function yuvToRgba(
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const o = (y * width + x) * 4
-        const v = expandRange(buf.y[y * buf.yStride + x], seq.colorRange)
+        const v = expandRange(buf.y[y * buf.yStride + x], seq.colorRange, seq.bitDepth)
         out[o] = v
         out[o + 1] = v
         out[o + 2] = v
@@ -131,6 +134,9 @@ export function yuvToRgba(
   const ssHor = seq.subsamplingX
   const ssVer = seq.subsamplingY
   const fullRange = seq.colorRange
+  const depthScale = 1 << (seq.bitDepth - 8)
+  const sampleMax = (1 << seq.bitDepth) - 1
+  const neutral = 128 * depthScale
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -143,14 +149,14 @@ export function yuvToRgba(
       let uf: number
       let vf: number
       if (fullRange) {
-        yf = yv / 255
-        uf = (u - 128) / 255
-        vf = (v - 128) / 255
+        yf = yv / sampleMax
+        uf = (u - neutral) / sampleMax
+        vf = (v - neutral) / sampleMax
       }
       else {
-        yf = (yv - 16) / 219
-        uf = (u - 128) / 224
-        vf = (v - 128) / 224
+        yf = (yv - 16 * depthScale) / (219 * depthScale)
+        uf = (u - neutral) / (224 * depthScale)
+        vf = (v - neutral) / (224 * depthScale)
       }
 
       out[o] = clip255(Math.round((yf + crCoeff * vf) * 255))
@@ -166,13 +172,17 @@ function clip255(v: number): number {
   return v < 0 ? 0 : v > 255 ? 255 : v
 }
 
-function expandRange(v: number, fullRange: boolean): number {
-  return fullRange ? v : clip255(Math.round(((v - 16) / 219) * 255))
+function expandRange(v: number, fullRange: boolean, bitDepth: number): number {
+  const scale = 1 << (bitDepth - 8)
+  const max = (1 << bitDepth) - 1
+  return fullRange
+    ? clip255(Math.round(v * 255 / max))
+    : clip255(Math.round(((v - 16 * scale) / (219 * scale)) * 255))
 }
 
 /** Bilinear chroma upsample for one sample position (co-located siting). */
 function sampleChroma(
-  plane: Uint8Array,
+  plane: PixelPlane,
   stride: number,
   x: number,
   y: number,

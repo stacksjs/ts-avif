@@ -6,6 +6,7 @@
  */
 import type { Av1Block, TileDecoder } from './decode-tile'
 import type { LoopFilterData } from './loopfilter'
+import type { PixelPlane } from './pixels'
 import type { SequenceHeader } from './sequence'
 import { IntraPredMode } from './consts'
 import { TXFM_INFO } from './decode-tile'
@@ -17,28 +18,36 @@ import {
   prepareIntraEdges,
 } from './ipred'
 import { itxfmAdd } from './itx'
+import { createPixelPlane } from './pixels'
 import { BLOCK_DIMENSIONS } from './tables'
 
 const EDGE_OFF = 128
 
 export class FrameBuffers {
-  y: Uint8Array
-  u: Uint8Array
-  v: Uint8Array
+  y: PixelPlane
+  u: PixelPlane
+  v: PixelPlane
   yStride: number
   uvStride: number
 
-  constructor(miCols: number, miRows: number, ssHor: number, ssVer: number, monochrome: boolean) {
+  constructor(
+    miCols: number,
+    miRows: number,
+    ssHor: number,
+    ssVer: number,
+    monochrome: boolean,
+    bitDepth = 8,
+  ) {
     this.yStride = miCols * 4
     this.uvStride = (miCols * 4) >> ssHor
     const yH = miRows * 4
     const uvH = (miRows * 4) >> ssVer
-    this.y = new Uint8Array(this.yStride * yH)
-    this.u = monochrome ? new Uint8Array(0) : new Uint8Array(this.uvStride * uvH)
-    this.v = monochrome ? new Uint8Array(0) : new Uint8Array(this.uvStride * uvH)
+    this.y = createPixelPlane(this.yStride * yH, bitDepth)
+    this.u = createPixelPlane(monochrome ? 0 : this.uvStride * uvH, bitDepth)
+    this.v = createPixelPlane(monochrome ? 0 : this.uvStride * uvH, bitDepth)
   }
 
-  plane(i: number): Uint8Array {
+  plane(i: number): PixelPlane {
     return i === 0 ? this.y : i === 1 ? this.u : this.v
   }
 
@@ -70,7 +79,7 @@ function smFlagUv(mode: number): number {
 }
 
 export class PixelReconstructor {
-  private edge = new Uint8Array(260)
+  private edge: PixelPlane
   private ac = new Int16Array(32 * 32)
   private intraEdgeFilterFlag: number
   /** Per-block state captured at startBlock. */
@@ -81,6 +90,7 @@ export class PixelReconstructor {
   lfLevels: Uint8Array | null = null
 
   constructor(readonly buf: FrameBuffers, readonly seq: SequenceHeader) {
+    this.edge = createPixelPlane(260, seq.bitDepth)
     this.intraEdgeFilterFlag = seq.enableIntraEdgeFilter ? 1 << 10 : 0
   }
 
@@ -222,8 +232,21 @@ export class PixelReconstructor {
         0,
         this.edge,
         EDGE_OFF,
+        this.seq.bitDepth,
       )
-      cflPred(mode, plane, dstOff, stride, this.edge, EDGE_OFF, uvTDim.w * 4, uvTDim.h * 4, this.ac, b.cflAlpha[pl])
+      cflPred(
+        mode,
+        plane,
+        dstOff,
+        stride,
+        this.edge,
+        EDGE_OFF,
+        uvTDim.w * 4,
+        uvTDim.h * 4,
+        this.ac,
+        b.cflAlpha[pl],
+        this.seq.bitDepth,
+      )
     }
   }
 
@@ -265,6 +288,7 @@ export class PixelReconstructor {
         this.seq.enableIntraEdgeFilter ? 1 : 0,
         this.edge,
         EDGE_OFF,
+        this.seq.bitDepth,
       )
       angle = prep.angle
       intraPred(
@@ -279,6 +303,7 @@ export class PixelReconstructor {
         angle | this.blockIntraFlags,
         4 * dec.bw4 - 4 * dec.bx,
         4 * dec.bh4 - 4 * dec.by,
+        this.seq.bitDepth,
       )
     }
     else {
@@ -306,6 +331,7 @@ export class PixelReconstructor {
           this.seq.enableIntraEdgeFilter ? 1 : 0,
           this.edge,
           EDGE_OFF,
+          this.seq.bitDepth,
         )
         angle = prep.angle | this.intraEdgeFilterFlag
         intraPred(
@@ -320,11 +346,12 @@ export class PixelReconstructor {
           angle | this.blockUvFlags,
           (4 * dec.bw4 + ssHor - 4 * (bx << ssHor)) >> ssHor,
           (4 * dec.bh4 + ssVer - 4 * (by << ssVer)) >> ssVer,
+          this.seq.bitDepth,
         )
       }
     }
 
     if (eob >= 0)
-      itxfmAdd(pl, dstOff, stride, cf, tx, txtp, eob)
+      itxfmAdd(pl, dstOff, stride, cf, tx, txtp, eob, this.seq.bitDepth)
   }
 }

@@ -9,6 +9,8 @@
  */
 import { clamp } from './bits'
 import { IntraPredMode } from './consts'
+import type { PixelPlane } from './pixels'
+import { bitDepthMax, createPixelPlane, midSample } from './pixels'
 import { DR_INTRA_DERIVATIVE, FILTER_INTRA_TAPS, SM_WEIGHTS } from './tables'
 
 export const ANGLE_SMOOTH_EDGE_FLAG = 512
@@ -59,7 +61,7 @@ export function prepareIntraEdges(
   w: number,
   h: number,
   edgeFlags: number,
-  plane: Uint8Array,
+  plane: PixelPlane,
   dstOff: number,
   stride: number,
   mode: number,
@@ -67,10 +69,12 @@ export function prepareIntraEdges(
   tw: number,
   th: number,
   filterEdge: number,
-  edge: Uint8Array,
+  edge: PixelPlane,
   edgeOff: number,
+  bitDepth = 8,
 ): { mode: number, angle: number } {
   let angle = angleIn
+  const mid = midSample(bitDepth)
 
   if (mode >= IntraPredMode.VERT_PRED && mode <= IntraPredMode.VERT_LEFT_PRED) {
     angle = MODE_TO_ANGLE[mode - IntraPredMode.VERT_PRED] + 3 * angle
@@ -107,7 +111,7 @@ export function prepareIntraEdges(
         edge.fill(edge[leftBase + sz - pxHave], leftBase, leftBase + sz - pxHave)
     }
     else {
-      edge.fill(haveTop ? plane[topRow] : 129, leftBase, leftBase + sz)
+      edge.fill(haveTop ? plane[topRow] : mid + 1, leftBase, leftBase + sz)
     }
 
     if (need.bottomleft) {
@@ -138,7 +142,7 @@ export function prepareIntraEdges(
         edge.fill(edge[topBase + pxHave - 1], topBase + pxHave, topBase + sz)
     }
     else {
-      edge.fill(haveLeft ? plane[dstOff - 1] : 127, topBase, topBase + sz)
+      edge.fill(haveLeft ? plane[dstOff - 1] : mid - 1, topBase, topBase + sz)
     }
 
     if (need.topright) {
@@ -162,7 +166,7 @@ export function prepareIntraEdges(
     if (haveLeft)
       edge[edgeOff] = haveTop ? plane[topRow - 1] : plane[dstOff - 1]
     else
-      edge[edgeOff] = haveTop ? plane[topRow] : 128
+      edge[edgeOff] = haveTop ? plane[topRow] : mid
 
     if (mode === IntraPredMode.Z2_PRED && tw + th >= 6 && filterEdge) {
       edge[edgeOff] = ((edge[edgeOff - 1] + edge[edgeOff + 1]) * 5
@@ -173,11 +177,11 @@ export function prepareIntraEdges(
   return { mode, angle }
 }
 
-function clipPixel(v: number): number {
-  return v < 0 ? 0 : v > 255 ? 255 : v
+function clipPixel(v: number, max = 255): number {
+  return v < 0 ? 0 : v > max ? max : v
 }
 
-function splatDc(dst: Uint8Array, off: number, stride: number, width: number, height: number, dc: number): void {
+function splatDc(dst: PixelPlane, off: number, stride: number, width: number, height: number, dc: number): void {
   for (let y = 0; y < height; y++)
     dst.fill(dc, off + y * stride, off + y * stride + width)
 }
@@ -186,21 +190,21 @@ function ctz(v: number): number {
   return 31 - Math.clz32(v & -v)
 }
 
-function dcGenTop(edge: Uint8Array, o: number, width: number): number {
+function dcGenTop(edge: PixelPlane, o: number, width: number): number {
   let dc = width >> 1
   for (let i = 0; i < width; i++)
     dc += edge[o + 1 + i]
   return dc >> ctz(width)
 }
 
-function dcGenLeft(edge: Uint8Array, o: number, height: number): number {
+function dcGenLeft(edge: PixelPlane, o: number, height: number): number {
   let dc = height >> 1
   for (let i = 0; i < height; i++)
     dc += edge[o - (1 + i)]
   return dc >> ctz(height)
 }
 
-function dcGen(edge: Uint8Array, o: number, width: number, height: number): number {
+function dcGen(edge: PixelPlane, o: number, width: number, height: number): number {
   let dc = (width + height) >> 1
   for (let i = 0; i < width; i++)
     dc += edge[o + i + 1]
@@ -214,7 +218,7 @@ function dcGen(edge: Uint8Array, o: number, width: number, height: number): numb
   return dc
 }
 
-function ipredPaeth(dst: Uint8Array, off: number, stride: number, edge: Uint8Array, o: number, width: number, height: number): void {
+function ipredPaeth(dst: PixelPlane, off: number, stride: number, edge: PixelPlane, o: number, width: number, height: number): void {
   const topleft = edge[o]
   for (let y = 0; y < height; y++) {
     const left = edge[o - (y + 1)]
@@ -231,7 +235,7 @@ function ipredPaeth(dst: Uint8Array, off: number, stride: number, edge: Uint8Arr
   }
 }
 
-function ipredSmooth(dst: Uint8Array, off: number, stride: number, edge: Uint8Array, o: number, width: number, height: number): void {
+function ipredSmooth(dst: PixelPlane, off: number, stride: number, edge: PixelPlane, o: number, width: number, height: number): void {
   const right = edge[o + width]
   const bottom = edge[o - height]
   for (let y = 0; y < height; y++) {
@@ -245,7 +249,7 @@ function ipredSmooth(dst: Uint8Array, off: number, stride: number, edge: Uint8Ar
   }
 }
 
-function ipredSmoothV(dst: Uint8Array, off: number, stride: number, edge: Uint8Array, o: number, width: number, height: number): void {
+function ipredSmoothV(dst: PixelPlane, off: number, stride: number, edge: PixelPlane, o: number, width: number, height: number): void {
   const bottom = edge[o - height]
   for (let y = 0; y < height; y++) {
     const wv = SM_WEIGHTS[height + y]
@@ -256,7 +260,7 @@ function ipredSmoothV(dst: Uint8Array, off: number, stride: number, edge: Uint8A
   }
 }
 
-function ipredSmoothH(dst: Uint8Array, off: number, stride: number, edge: Uint8Array, o: number, width: number, height: number): void {
+function ipredSmoothH(dst: PixelPlane, off: number, stride: number, edge: PixelPlane, o: number, width: number, height: number): void {
   const right = edge[o + width]
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -331,12 +335,12 @@ const EDGE_KERNELS = [
  * Index helpers take (buffer, baseOffset) with signed relative indices.
  */
 function filterEdgeFn(
-  out: Uint8Array,
+  out: PixelPlane,
   outOff: number,
   sz: number,
   limFrom: number,
   limTo: number,
-  inp: Uint8Array,
+  inp: PixelPlane,
   inpOff: number,
   from: number,
   to: number,
@@ -363,13 +367,14 @@ function getUpsample(wh: number, angle: number, isSm: number): number {
 const UPSAMPLE_KERNEL = [-1, 9, 9, -1]
 
 function upsampleEdge(
-  out: Uint8Array,
+  out: PixelPlane,
   outOff: number,
   hsz: number,
-  inp: Uint8Array,
+  inp: PixelPlane,
   inpOff: number,
   from: number,
   to: number,
+  max: number,
 ): void {
   let i = 0
   for (; i < hsz - 1; i++) {
@@ -377,23 +382,23 @@ function upsampleEdge(
     let s = 0
     for (let j = 0; j < 4; j++)
       s += inp[inpOff + clamp(i + j - 1, from, to - 1)] * UPSAMPLE_KERNEL[j]
-    out[outOff + i * 2 + 1] = clipPixel((s + 8) >> 4)
+    out[outOff + i * 2 + 1] = clipPixel((s + 8) >> 4, max)
   }
   out[outOff + i * 2] = inp[inpOff + clamp(i, from, to - 1)]
 }
 
-function ipredZ1(dst: Uint8Array, off: number, stride: number, edge: Uint8Array, o: number, width: number, height: number, angleFl: number): void {
+function ipredZ1(dst: PixelPlane, off: number, stride: number, edge: PixelPlane, o: number, width: number, height: number, angleFl: number, max: number): void {
   const isSm = (angleFl >> 9) & 1
   const enableFilter = angleFl >> 10
   const angle = angleFl & 511
   let dx = DR_INTRA_DERIVATIVE[angle >> 1]
-  const topOut = new Uint8Array(64 + 64)
-  let top: Uint8Array
+  const topOut = createPixelPlane(64 + 64, max > 255 ? 16 : 8)
+  let top: PixelPlane
   let topOff: number
   let maxBaseX: number
   const upsampleAbove = enableFilter ? getUpsample(width + height, 90 - angle, isSm) : 0
   if (upsampleAbove) {
-    upsampleEdge(topOut, 0, width + height, edge, o + 1, -1, width + Math.min(width, height))
+    upsampleEdge(topOut, 0, width + height, edge, o + 1, -1, width + Math.min(width, height), max)
     top = topOut
     topOff = 0
     maxBaseX = 2 * (width + height) - 2
@@ -430,16 +435,17 @@ function ipredZ1(dst: Uint8Array, off: number, stride: number, edge: Uint8Array,
 }
 
 function ipredZ2(
-  dst: Uint8Array,
+  dst: PixelPlane,
   off: number,
   stride: number,
-  edge: Uint8Array,
+  edge: PixelPlane,
   o: number,
   width: number,
   height: number,
   angleFl: number,
   maxWidth: number,
   maxHeight: number,
+  max: number,
 ): void {
   const isSm = (angleFl >> 9) & 1
   const enableFilter = angleFl >> 10
@@ -448,11 +454,11 @@ function ipredZ2(
   let dx = DR_INTRA_DERIVATIVE[(180 - angle) >> 1]
   const upsampleLeft = enableFilter ? getUpsample(width + height, 180 - angle, isSm) : 0
   const upsampleAbove = enableFilter ? getUpsample(width + height, angle - 90, isSm) : 0
-  const edgeBuf = new Uint8Array(64 + 64 + 1)
+  const edgeBuf = createPixelPlane(64 + 64 + 1, max > 255 ? 16 : 8)
   const tl = 64
 
   if (upsampleAbove) {
-    upsampleEdge(edgeBuf, tl, width + 1, edge, o, 0, width + 1)
+    upsampleEdge(edgeBuf, tl, width + 1, edge, o, 0, width + 1, max)
     dx <<= 1
   }
   else {
@@ -466,7 +472,7 @@ function ipredZ2(
     }
   }
   if (upsampleLeft) {
-    upsampleEdge(edgeBuf, tl - height * 2, height + 1, edge, o - height, 0, height + 1)
+    upsampleEdge(edgeBuf, tl - height * 2, height + 1, edge, o - height, 0, height + 1, max)
     dy <<= 1
   }
   else {
@@ -501,18 +507,18 @@ function ipredZ2(
   }
 }
 
-function ipredZ3(dst: Uint8Array, off: number, stride: number, edge: Uint8Array, o: number, width: number, height: number, angleFl: number): void {
+function ipredZ3(dst: PixelPlane, off: number, stride: number, edge: PixelPlane, o: number, width: number, height: number, angleFl: number, max: number): void {
   const isSm = (angleFl >> 9) & 1
   const enableFilter = angleFl >> 10
   const angle = angleFl & 511
   let dy = DR_INTRA_DERIVATIVE[(270 - angle) >> 1]
-  const leftOut = new Uint8Array(64 + 64)
-  let left: Uint8Array
+  const leftOut = createPixelPlane(64 + 64, max > 255 ? 16 : 8)
+  let left: PixelPlane
   let leftOff: number
   let maxBaseY: number
   const upsampleLeft = enableFilter ? getUpsample(width + height, angle - 180, isSm) : 0
   if (upsampleLeft) {
-    upsampleEdge(leftOut, 0, width + height, edge, o - (width + height), Math.max(width - height, 0), width + height + 1)
+    upsampleEdge(leftOut, 0, width + height, edge, o - (width + height), Math.max(width - height, 0), width + height + 1, max)
     left = leftOut
     leftOff = 2 * (width + height) - 2
     maxBaseY = 2 * (width + height) - 2
@@ -550,16 +556,16 @@ function ipredZ3(dst: Uint8Array, off: number, stride: number, edge: Uint8Array,
 }
 
 /** FILTER_PRED, up to 32x32; filt_idx in the low bits of the angle arg. */
-function ipredFilter(dst: Uint8Array, off: number, stride: number, edge: Uint8Array, o: number, width: number, height: number, filtIdxFl: number): void {
+function ipredFilter(dst: PixelPlane, off: number, stride: number, edge: PixelPlane, o: number, width: number, height: number, filtIdxFl: number, max: number): void {
   const filtIdx = filtIdxFl & 511
   const fBase = filtIdx * 64
-  let topBuf: Uint8Array = edge
+  let topBuf: PixelPlane = edge
   let topOff = o + 1
   let dstRow = off
   for (let y = 0; y < height; y += 2) {
-    let topleftBuf: Uint8Array = edge
+    let topleftBuf: PixelPlane = edge
     let topleftOff = o - y
-    let leftBuf: Uint8Array = topleftBuf
+    let leftBuf: PixelPlane = topleftBuf
     let leftOff = topleftOff - 1
     let leftStride = -1
     let top = topOff
@@ -582,7 +588,7 @@ function ipredFilter(dst: Uint8Array, off: number, stride: number, edge: Uint8Ar
             + FILTER_INTRA_TAPS[flt + 32] * p4
             + FILTER_INTRA_TAPS[flt + 40] * p5
             + FILTER_INTRA_TAPS[flt + 48] * p6
-          dst[ptr + xx] = clipPixel((acc + 8) >> 4)
+          dst[ptr + xx] = clipPixel((acc + 8) >> 4, max)
         }
         ptr += stride
       }
@@ -605,23 +611,25 @@ function ipredFilter(dst: Uint8Array, off: number, stride: number, edge: Uint8Ar
  */
 export function intraPred(
   mode: number,
-  dst: Uint8Array,
+  dst: PixelPlane,
   off: number,
   stride: number,
-  edge: Uint8Array,
+  edge: PixelPlane,
   o: number,
   width: number,
   height: number,
   angleFl: number,
   maxWidth: number,
   maxHeight: number,
+  bitDepth = 8,
 ): void {
+  const max = bitDepthMax(bitDepth)
   switch (mode) {
     case IntraPredMode.DC_PRED:
       splatDc(dst, off, stride, width, height, dcGen(edge, o, width, height))
       break
     case IntraPredMode.DC_128_PRED:
-      splatDc(dst, off, stride, width, height, 128)
+      splatDc(dst, off, stride, width, height, midSample(bitDepth))
       break
     case IntraPredMode.TOP_DC_PRED:
       splatDc(dst, off, stride, width, height, dcGenTop(edge, o, width))
@@ -652,16 +660,16 @@ export function intraPred(
       ipredSmoothH(dst, off, stride, edge, o, width, height)
       break
     case IntraPredMode.Z1_PRED:
-      ipredZ1(dst, off, stride, edge, o, width, height, angleFl)
+      ipredZ1(dst, off, stride, edge, o, width, height, angleFl, max)
       break
     case IntraPredMode.Z2_PRED:
-      ipredZ2(dst, off, stride, edge, o, width, height, angleFl, maxWidth, maxHeight)
+      ipredZ2(dst, off, stride, edge, o, width, height, angleFl, maxWidth, maxHeight, max)
       break
     case IntraPredMode.Z3_PRED:
-      ipredZ3(dst, off, stride, edge, o, width, height, angleFl)
+      ipredZ3(dst, off, stride, edge, o, width, height, angleFl, max)
       break
     case IntraPredMode.FILTER_PRED:
-      ipredFilter(dst, off, stride, edge, o, width, height, angleFl)
+      ipredFilter(dst, off, stride, edge, o, width, height, angleFl, max)
       break
     default:
       throw new Error(`ts-avif: unknown intra prediction mode ${mode}`)
@@ -671,7 +679,7 @@ export function intraPred(
 /** Chroma-from-luma AC buffer: subsampled, DC-subtracted luma (cfl_ac_c). */
 export function cflAc(
   ac: Int16Array,
-  yPlane: Uint8Array,
+  yPlane: PixelPlane,
   yOff: number,
   stride: number,
   wPad: number,
@@ -719,15 +727,16 @@ export function cflAc(
 /** CFL prediction: DC prediction modulated by the AC buffer (cfl_pred). */
 export function cflPred(
   mode: number,
-  dst: Uint8Array,
+  dst: PixelPlane,
   off: number,
   stride: number,
-  edge: Uint8Array,
+  edge: PixelPlane,
   o: number,
   width: number,
   height: number,
   ac: Int16Array,
   alpha: number,
+  bitDepth = 8,
 ): void {
   let dc: number
   switch (mode) {
@@ -735,7 +744,7 @@ export function cflPred(
       dc = dcGen(edge, o, width, height)
       break
     case IntraPredMode.DC_128_PRED:
-      dc = 128
+      dc = midSample(bitDepth)
       break
     case IntraPredMode.TOP_DC_PRED:
       dc = dcGenTop(edge, o, width)
@@ -751,7 +760,7 @@ export function cflPred(
     for (let x = 0; x < width; x++) {
       const diff = alpha * ac[acPos + x]
       const adj = (Math.abs(diff) + 32) >> 6
-      dst[off + y * stride + x] = clipPixel(dc + (diff < 0 ? -adj : adj))
+      dst[off + y * stride + x] = clipPixel(dc + (diff < 0 ? -adj : adj), bitDepthMax(bitDepth))
     }
     acPos += width
   }
