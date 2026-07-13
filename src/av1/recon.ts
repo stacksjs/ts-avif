@@ -5,6 +5,7 @@
  * recon_b_intra).
  */
 import type { Av1Block, TileDecoder } from './decode-tile'
+import type { LoopFilterData } from './loopfilter'
 import type { SequenceHeader } from './sequence'
 import { IntraPredMode } from './consts'
 import { TXFM_INFO } from './decode-tile'
@@ -16,6 +17,7 @@ import {
   prepareIntraEdges,
 } from './ipred'
 import { itxfmAdd } from './itx'
+import { BLOCK_DIMENSIONS } from './tables'
 
 const EDGE_OFF = 128
 
@@ -45,6 +47,10 @@ export class FrameBuffers {
   }
 }
 
+function bx4Odd(v: number): boolean {
+  return (v & 1) === 1
+}
+
 function smFlagY(intra: number, mode: number): number {
   if (!intra)
     return 0
@@ -70,12 +76,15 @@ export class PixelReconstructor {
   /** Per-block state captured at startBlock. */
   private blockIntraFlags = 0
   private blockUvFlags = 0
+  /** Optional loop-filter metadata sink and per-segment levels. */
+  lf: LoopFilterData | null = null
+  lfLevels: Uint8Array | null = null
 
   constructor(readonly buf: FrameBuffers, readonly seq: SequenceHeader) {
     this.intraEdgeFilterFlag = seq.enableIntraEdgeFilter ? 1 << 10 : 0
   }
 
-  startBlock(_bs: number, _b: Av1Block, dec: TileDecoder): void {
+  startBlock(bs: number, b: Av1Block, dec: TileDecoder): void {
     const bx4 = dec.bx
     const by4 = dec.by & 31
     const cbx4 = bx4 >> dec.ssHor
@@ -85,6 +94,81 @@ export class PixelReconstructor {
         | smFlagY(dec.l.intra[by4], dec.l.mode[by4])
         | this.intraEdgeFilterFlag
     this.blockUvFlags = smFlagUv(dec.a.uvmode[cbx4]) | smFlagUv(dec.l.uvmode[cby4])
+
+    if (this.lf && this.lfLevels)
+      this.recordLoopFilter(bs, b, dec)
+  }
+
+  private recordLoopFilter(bs: number, b: Av1Block, dec: TileDecoder): void {
+    const lf = this.lf!
+    const lvls = this.lfLevels!
+    const ssHor = dec.ssHor
+    const ssVer = dec.ssVer
+    const bDimOff = bs * 4
+    const bw4 = BLOCK_DIMENSIONS[bDimOff]
+    const bh4 = BLOCK_DIMENSIONS[bDimOff + 1]
+    const miCols = dec.bw4
+    const miRows = dec.bh4
+
+    const lvlYV = lvls[b.segId * 4 + 0]
+    const lvlYH = lvls[b.segId * 4 + 1]
+    const yt = TXFM_INFO[b.tx]
+
+    for (let ly = 0; ly < bh4; ly++) {
+      const cy = dec.by + ly
+      if (cy >= miRows)
+        break
+      const hEdge = ly % yt.h === 0 ? 1 : 0
+      for (let lx = 0; lx < bw4; lx++) {
+        const cx = dec.bx + lx
+        if (cx >= miCols)
+          break
+        const cell = cy * miCols + cx
+        lf.lvlYV[cell] = lvlYV
+        lf.lvlYH[cell] = lvlYH
+        lf.txlwY[cell] = yt.lw
+        lf.txlhY[cell] = yt.lh
+        if (lx % yt.w === 0)
+          lf.stepVY[cell] = 1
+        if (hEdge)
+          lf.stepHY[cell] = 1
+      }
+    }
+
+    if (dec.seq.monochrome)
+      return
+    const hasChroma = (bw4 > ssHor || (bx4Odd(dec.bx)))
+      && (bh4 > ssVer || (bx4Odd(dec.by)))
+    if (!hasChroma)
+      return
+    const cbw4 = (bw4 + ssHor) >> ssHor
+    const cbh4 = (bh4 + ssVer) >> ssVer
+    const cbx4 = dec.bx >> ssHor
+    const cby4 = dec.by >> ssVer
+    const lvlU = lvls[b.segId * 4 + 2]
+    const lvlV = lvls[b.segId * 4 + 3]
+    const ut = TXFM_INFO[b.uvtx]
+
+    for (let ly = 0; ly < cbh4; ly++) {
+      const cy = cby4 + ly
+      if (cy >= lf.cRows)
+        break
+      const hEdge = ly % ut.h === 0 ? 1 : 0
+      for (let lx = 0; lx < cbw4; lx++) {
+        const cx = cbx4 + lx
+        if (cx >= lf.cCols)
+          break
+        const cell = cy * lf.cCols + cx
+        lf.lvlU[cell] = lvlU
+        lf.lvlV[cell] = lvlV
+        lf.txlwUv[cell] = ut.lw
+        lf.txlhUv[cell] = ut.lh
+        if (lx % ut.w === 0)
+          lf.stepVUv[cell] = 1
+        if (hEdge)
+          lf.stepHUv[cell] = 1
+      }
+    }
   }
 
   predictCfl(b: Av1Block, dec: TileDecoder, cbw4: number, cbh4: number, cw4: number, ch4: number): void {

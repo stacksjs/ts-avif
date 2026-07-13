@@ -8,6 +8,7 @@ import type { Tile } from './tile-group'
 import { CdfContext } from './cdf'
 import { TileDecoder } from './decode-tile'
 import { INTRA_EDGE_TREE } from './intra-edge'
+import { applyLoopFilter, computeLoopFilterLevels, LoopFilterData } from './loopfilter'
 import { FrameBuffers, PixelReconstructor } from './recon'
 
 export interface DecodedFrame {
@@ -25,6 +26,11 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     seq.monochrome,
   )
   const recon = new PixelReconstructor(buf, seq)
+  const lfActive = hdr.loopFilter.levels[0] !== 0 || hdr.loopFilter.levels[1] !== 0
+  if (lfActive) {
+    recon.lf = new LoopFilterData(hdr.miCols, hdr.miRows, seq.subsamplingX, seq.subsamplingY)
+    recon.lfLevels = computeLoopFilterLevels(hdr)
+  }
   const sbRoot = INTRA_EDGE_TREE[seq.use128x128Superblock ? 0 : 1]
 
   const { tileCols, tileRows, miColStarts, miRowStarts } = hdr.tileInfo
@@ -39,6 +45,9 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     dec.rowEnd = Math.min(miRowStarts[tile.tileRow + 1], hdr.miRows)
     dec.decodeTile(sbRoot)
   }
+
+  if (recon.lf)
+    applyLoopFilter(buf, recon.lf, seq, hdr)
 
   return { buf, width: hdr.frameWidth, height: hdr.frameHeight }
 }
