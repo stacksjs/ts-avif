@@ -104,6 +104,24 @@ export interface LrParams {
   loopRestorationSize: number[]
 }
 
+export interface FilmGrainParams {
+  seed: number
+  yPoints: [number, number][]
+  chromaScalingFromLuma: boolean
+  uvPoints: [[number, number][], [number, number][]]
+  scalingShift: number
+  arCoeffLag: number
+  arCoeffsY: number[]
+  arCoeffsUv: [number[], number[]]
+  arCoeffShift: number
+  grainScaleShift: number
+  uvMult: [number, number]
+  uvLumaMult: [number, number]
+  uvOffset: [number, number]
+  overlap: boolean
+  clipToRestrictedRange: boolean
+}
+
 export interface FrameHeader {
   frameType: number
   showFrame: boolean
@@ -145,6 +163,7 @@ export interface FrameHeader {
   lr: LrParams
   txMode: number
   reducedTxSet: boolean
+  filmGrain: FilmGrainParams | null
 }
 
 function tileLog2(blkSize: number, target: number): number {
@@ -341,11 +360,64 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
   const reducedTxSet = r.readBit() === 1
 
   // global_motion_params(): no bits for intra frames
-  // film_grain_params()
+  // film_grain_params(); intra frames always carry a fresh parameter set.
+  let filmGrain: FilmGrainParams | null = null
   if (seq.filmGrainParamsPresent && (showFrame || showableFrame)) {
     const applyGrain = r.readBit() === 1
-    if (applyGrain)
-      throw new Error('ts-avif: film grain synthesis is not supported yet')
+    if (applyGrain) {
+      const seed = r.readBits(16)
+      const yPoints = readGrainPoints(r, 14)
+      const chromaScalingFromLuma = !seq.monochrome && r.readBit() === 1
+      const uvPoints: [[number, number][], [number, number][]] = [[], []]
+      const omitUvPoints = seq.monochrome || chromaScalingFromLuma
+        || (seq.subsamplingX === 1 && seq.subsamplingY === 1 && yPoints.length === 0)
+      if (!omitUvPoints) {
+        uvPoints[0] = readGrainPoints(r, 10)
+        uvPoints[1] = readGrainPoints(r, 10)
+      }
+      if (seq.subsamplingX === 1 && seq.subsamplingY === 1
+        && (uvPoints[0].length === 0) !== (uvPoints[1].length === 0)) {
+        throw new Error('ts-avif: invalid 4:2:0 film-grain chroma point sets')
+      }
+      const scalingShift = r.readBits(2) + 8
+      const arCoeffLag = r.readBits(2)
+      const numYPos = 2 * arCoeffLag * (arCoeffLag + 1)
+      const arCoeffsY = yPoints.length ? readSignedGrainCoeffs(r, numYPos) : []
+      const arCoeffsUv: [number[], number[]] = [[], []]
+      for (let plane = 0; plane < 2; plane++) {
+        if (uvPoints[plane].length || chromaScalingFromLuma)
+          arCoeffsUv[plane] = readSignedGrainCoeffs(r, numYPos + (yPoints.length ? 1 : 0))
+      }
+      const arCoeffShift = r.readBits(2) + 6
+      const grainScaleShift = r.readBits(2)
+      const uvMult: [number, number] = [0, 0]
+      const uvLumaMult: [number, number] = [0, 0]
+      const uvOffset: [number, number] = [0, 0]
+      for (let plane = 0; plane < 2; plane++) {
+        if (uvPoints[plane].length) {
+          uvMult[plane] = r.readBits(8) - 128
+          uvLumaMult[plane] = r.readBits(8) - 128
+          uvOffset[plane] = r.readBits(9) - 256
+        }
+      }
+      filmGrain = {
+        seed,
+        yPoints,
+        chromaScalingFromLuma,
+        uvPoints,
+        scalingShift,
+        arCoeffLag,
+        arCoeffsY,
+        arCoeffsUv,
+        arCoeffShift,
+        grainScaleShift,
+        uvMult,
+        uvLumaMult,
+        uvOffset,
+        overlap: r.readBit() === 1,
+        clipToRestrictedRange: r.readBit() === 1,
+      }
+    }
   }
 
   return {
@@ -387,7 +459,27 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
     lr,
     txMode,
     reducedTxSet,
+    filmGrain,
   }
+}
+
+function readGrainPoints(r: BitReader, maxPoints: number): [number, number][] {
+  const count = r.readBits(4)
+  if (count > maxPoints)
+    throw new Error(`ts-avif: invalid film-grain point count ${count}`)
+  const points: [number, number][] = []
+  for (let i = 0; i < count; i++) {
+    const x = r.readBits(8)
+    const y = r.readBits(8)
+    if (i && x <= points[i - 1][0])
+      throw new Error('ts-avif: film-grain scaling points are not increasing')
+    points.push([x, y])
+  }
+  return points
+}
+
+function readSignedGrainCoeffs(r: BitReader, count: number): number[] {
+  return Array.from({ length: count }, () => r.readBits(8) - 128)
 }
 
 function parseTileInfo(r: BitReader, seq: SequenceHeader, miCols: number, miRows: number): TileInfo {

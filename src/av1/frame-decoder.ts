@@ -9,6 +9,7 @@ import type { PixelPlane } from './pixels'
 import { applyCdef, CdefData } from './cdef'
 import { CdfContext } from './cdf'
 import { TileDecoder } from './decode-tile'
+import { applyFilmGrain } from './film-grain'
 import { INTRA_EDGE_TREE } from './intra-edge'
 import { applyLoopFilter, computeLoopFilterLevels, LoopFilterData } from './loopfilter'
 import { FrameBuffers, PixelReconstructor } from './recon'
@@ -108,6 +109,9 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
 
   if (lrActive && deblocked)
     applyRestoration(buf, restorationInfo!, seq, hdr, deblocked)
+
+  if (hdr.filmGrain)
+    buf = applyFilmGrain(buf, seq, hdr.filmGrain, hdr.upscaledWidth, hdr.frameHeight)
 
   return { buf, width: hdr.upscaledWidth, height: hdr.frameHeight }
 }
