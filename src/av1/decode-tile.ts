@@ -199,6 +199,12 @@ export class TileDecoder {
   levels = new Uint8Array(1088)
   cdefIdx = [-1, -1, -1, -1]
 
+  /** Per-4x4 segment id map for the whole frame (spatial prediction). */
+  segMap: Uint8Array | null = null
+
+  /** Loop-restoration reader (consumes per-SB entropy bits when active). */
+  restoration: { readForSuperblock: (m: SymbolDecoder, c: CdfContext, bx: number, by: number) => void } | null = null
+
   recon: Reconstructor | null
 
   constructor(
@@ -230,6 +236,9 @@ export class TileDecoder {
       this.frameDq.push(computeDq(hdr, hdr.segQIndex[seg]))
     this.dq = this.frameDq
     this.lastQIdx = hdr.quantization.baseQIdx
+
+    if (hdr.segmentation.enabled)
+      this.segMap = new Uint8Array(this.bw4 * this.bh4)
   }
 
   /** Decode every superblock of the (single-tile-column) tile. */
@@ -240,6 +249,7 @@ export class TileDecoder {
       this.l.reset(true)
       for (this.bx = this.colStart; this.bx < this.colEnd; this.bx += sbStep) {
         this.cdefIdx[0] = this.cdefIdx[1] = this.cdefIdx[2] = this.cdefIdx[3] = -1
+        this.restoration?.readForSuperblock(this.msac, this.cdf, this.bx, this.by)
         this.decodeSb(rootBl, sbRoot)
       }
     }
@@ -450,10 +460,10 @@ export class TileDecoder {
       uvtx: TxfmSize.TX_4X4,
     }
 
-    // segment_id (pre-skip)
+    // segment_id (pre-skip). The seg map is frame-absolute, so use this.by.
     const seg = hdr.segmentation
     if (seg.enabled && seg.updateMap && seg.segIdPreSkip)
-      b.segId = this.readSegId(bx4, by4, w4, h4, haveTop, haveLeft, false)
+      b.segId = this.readSegId(this.bx, this.by, w4, h4, haveTop, haveLeft, false)
 
     // skip_mode: never present in intra frames
     b.skipMode = 0
@@ -466,7 +476,9 @@ export class TileDecoder {
 
     // segment_id (post-skip)
     if (seg.enabled && seg.updateMap && !seg.segIdPreSkip)
-      b.segId = this.readSegId(bx4, by4, w4, h4, haveTop, haveLeft, b.skip === 1)
+      b.segId = this.readSegId(this.bx, this.by, w4, h4, haveTop, haveLeft, b.skip === 1)
+    if (seg.enabled)
+      this.writeSegMap(this.bx, this.by, bw4, bh4, b.segId)
 
     // cdef index
     if (!b.skip) {
@@ -681,16 +693,56 @@ export class TileDecoder {
   }
 
   private readSegId(
-    _bx4: number,
-    _by4: number,
+    bx4: number,
+    by4: number,
     _w4: number,
     _h4: number,
-    _haveTop: boolean,
-    _haveLeft: boolean,
-    _skip: boolean,
+    haveTop: boolean,
+    haveLeft: boolean,
+    skip: boolean,
   ): number {
-    // Segmentation with update_map on an intra frame; rare for AVIF stills.
-    throw new Error('ts-avif: segmentation map decoding is not supported yet')
+    const map = this.segMap!
+    const stride = this.bw4
+    const base = by4 * stride + bx4
+    // get_cur_frame_segid: spatial prediction + context
+    let segCtx: number
+    let predSegId: number
+    if (haveLeft && haveTop) {
+      const l = map[base - 1]
+      const a = map[base - stride]
+      const al = map[base - stride - 1]
+      if (l === a && al === l)
+        segCtx = 2
+      else if (l === a || al === l || a === al)
+        segCtx = 1
+      else
+        segCtx = 0
+      predSegId = a === al ? a : l
+    }
+    else {
+      segCtx = 0
+      predSegId = haveLeft ? map[base - 1] : haveTop ? map[base - stride] : 0
+    }
+
+    if (skip)
+      return predSegId
+
+    const diff = this.msac.decodeSymbol(this.cdf.data, this.cdf.offset('seg_id', segCtx), 7)
+    const lastActive = this.hdr.segmentation.lastActiveSegId
+    let segId = negDeinterleave(diff, predSegId, lastActive + 1)
+    if (segId > lastActive || segId >= 8)
+      segId = 0
+    return segId
+  }
+
+  /** Write the block's segment id to every 4x4 cell it covers (frame-clamped). */
+  private writeSegMap(bx4: number, by4: number, bw4: number, bh4: number, segId: number): void {
+    const map = this.segMap!
+    const stride = this.bw4
+    const w = Math.min(bw4, this.bw4 - bx4)
+    const h = Math.min(bh4, this.bh4 - by4)
+    for (let y = 0; y < h; y++)
+      map.fill(segId, (by4 + y) * stride + bx4, (by4 + y) * stride + bx4 + w)
   }
 
   /**
@@ -1221,6 +1273,22 @@ export class TileDecoder {
       s += lArr[lOff + i] >> 6
     return (s !== 0 ? 1 : 0) + (s > 0 ? 1 : 0)
   }
+}
+
+/** neg_deinterleave: recover a segment id from its neighbor-relative code. */
+function negDeinterleave(diff: number, ref: number, max: number): number {
+  if (!ref)
+    return diff
+  if (ref >= max - 1)
+    return max - diff - 1
+  if (2 * ref < max) {
+    if (diff <= 2 * ref)
+      return diff & 1 ? ref + ((diff + 1) >> 1) : ref - (diff >> 1)
+    return diff
+  }
+  if (diff <= 2 * (max - ref - 1))
+    return diff & 1 ? ref + ((diff + 1) >> 1) : ref - (diff >> 1)
+  return max - (diff + 1)
 }
 
 function gatherTopPartitionProb(data: Uint16Array, off: number, bl: BlockLevel): number {
