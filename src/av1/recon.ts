@@ -18,6 +18,7 @@ import {
   prepareIntraEdges,
 } from './ipred'
 import { itxfmAdd } from './itx'
+import { motionCompensate } from './mc'
 import { createPixelPlane } from './pixels'
 import { BLOCK_DIMENSIONS } from './tables'
 
@@ -200,12 +201,42 @@ export class PixelReconstructor {
       const src = first.plane(plane)
       const src2 = second?.plane(plane)
       const srcStride2 = second?.stride(plane) ?? 0
+      const phaseX = (b.mvX & (ssHor ? 15 : 7)) << (ssHor ? 0 : 1)
+      const phaseY = (b.mvY & (ssVer ? 15 : 7)) << (ssVer ? 0 : 1)
+      if (!src2) {
+        motionCompensate(
+          dst,
+          dstStride,
+          dstX,
+          dstY,
+          src,
+          srcStride,
+          plane ? first.uvStride : first.yStride,
+          Math.floor(src.length / srcStride),
+          srcX,
+          srcY,
+          width,
+          height,
+          phaseX,
+          phaseY,
+          b.filterH,
+          b.filterV,
+          this.seq.bitDepth,
+        )
+        continue
+      }
+      const firstPrediction = this.seq.bitDepth > 8
+        ? new Uint16Array(width * height)
+        : new Uint8Array(width * height)
+      const secondPrediction = this.seq.bitDepth > 8
+        ? new Uint16Array(width * height)
+        : new Uint8Array(width * height)
+      motionCompensate(firstPrediction, width, 0, 0, src, srcStride, srcStride, Math.floor(src.length / srcStride), srcX, srcY, width, height, phaseX, phaseY, b.filterH, b.filterV, this.seq.bitDepth)
+      motionCompensate(secondPrediction, width, 0, 0, src2, srcStride2, srcStride2, Math.floor(src2.length / srcStride2), srcX2, srcY2, width, height, (b.mvX2 & (ssHor ? 15 : 7)) << (ssHor ? 0 : 1), (b.mvY2 & (ssVer ? 15 : 7)) << (ssVer ? 0 : 1), b.filterH, b.filterV, this.seq.bitDepth)
       for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
-          const a = src[(srcY + y) * srcStride + srcX + x]
-          dst[(dstY + y) * dstStride + dstX + x] = src2
-            ? (a + src2[(srcY2 + y) * srcStride2 + srcX2 + x] + 1) >> 1
-            : a
+          const i = y * width + x
+          dst[(dstY + y) * dstStride + dstX + x] = (firstPrediction[i] + secondPrediction[i] + 1) >> 1
         }
       }
     }

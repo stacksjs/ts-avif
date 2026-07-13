@@ -84,6 +84,20 @@ function yModeSizeContext(bs: BlockSize): number {
   return Y_MODE_SIZE_CONTEXT[bs]
 }
 
+function uvInterTxtp(tDim: TxfmInfo, luma: number): number {
+  if (tDim.max === TxfmSize.TX_32X32)
+    return luma === TxfmType.IDTX ? TxfmType.IDTX : TxfmType.DCT_DCT
+  if (tDim.min === TxfmSize.TX_16X16
+    && (luma === TxfmType.H_FLIPADST || luma === TxfmType.V_FLIPADST
+      || luma === TxfmType.H_ADST || luma === TxfmType.V_ADST))
+    return TxfmType.DCT_DCT
+  return luma
+}
+
+function binaryCountContext(first: number, second: number): number {
+  return first === second ? 1 : first < second ? 0 : 2
+}
+
 export interface Av1Block {
   bl: number
   bp: number
@@ -108,6 +122,11 @@ export interface Av1Block {
   ref1: number
   mvX2: number
   mvY2: number
+  newMv: number
+  txSplit0: number
+  txSplit1: number
+  filterH: number
+  filterV: number
   tx: number
   uvtx: number
 }
@@ -244,6 +263,14 @@ export class TileDecoder {
   /** Per-4x4 segment id map for the whole frame (spatial prediction). */
   segMap: Uint8Array | null = null
 
+  /** Current-frame inter metadata used to build spatial MV candidates. */
+  interRef = new Int8Array(0)
+  interMvX = new Int16Array(0)
+  interMvY = new Int16Array(0)
+  interNewMv = new Uint8Array(0)
+  interBs = new Uint8Array(0)
+  txtpMap = new Uint8Array(32 * 32)
+
   /** Loop-restoration reader (consumes per-SB entropy bits when active). */
   restoration: { readForSuperblock: (m: SymbolDecoder, c: CdfContext, bx: number, by: number) => void } | null = null
 
@@ -286,6 +313,14 @@ export class TileDecoder {
       this.frameDq.push(computeDq(seq.bitDepth, hdr, hdr.segQIndex[seg]))
     this.dq = this.frameDq
     this.lastQIdx = hdr.quantization.baseQIdx
+
+    const n4 = this.bw4 * this.bh4
+    this.interRef = new Int8Array(n4)
+    this.interRef.fill(-1)
+    this.interMvX = new Int16Array(n4)
+    this.interMvY = new Int16Array(n4)
+    this.interNewMv = new Uint8Array(n4)
+    this.interBs = new Uint8Array(n4)
 
     if (hdr.segmentation.enabled)
       this.segMap = new Uint8Array(this.bw4 * this.bh4)
@@ -528,6 +563,11 @@ export class TileDecoder {
       ref1: -1,
       mvX2: 0,
       mvY2: 0,
+      newMv: 0,
+      txSplit0: 0,
+      txSplit1: 0,
+      filterH: hdr.interpolationFilter,
+      filterV: hdr.interpolationFilter,
       tx: TxfmSize.TX_4X4,
       uvtx: TxfmSize.TX_4X4,
     }
@@ -638,8 +678,17 @@ export class TileDecoder {
       b.intra = 0
     }
     else if (!this.frameIsIntra) {
-      const ictx = (haveLeft ? this.l.intra[by4] : 0)
-        + (haveTop ? this.a.intra[bx4] : 0)
+      let ictx: number
+      if (haveLeft && haveTop) {
+        const sum = this.l.intra[by4] + this.a.intra[bx4]
+        ictx = sum + (sum === 2 ? 1 : 0)
+      }
+      else if (haveLeft) {
+        ictx = this.l.intra[by4] * 2
+      }
+      else {
+        ictx = haveTop ? this.a.intra[bx4] * 2 : 0
+      }
       b.intra = 1 - msac.decodeBoolAdapt(cdf.data, cdf.offset('intra', ictx))
     }
     else {
@@ -901,77 +950,133 @@ export class TileDecoder {
 
     b.ref0 = this.readSingleReference(bx4, by4, haveTop, haveLeft)
     b.ref1 = -1
-    const candidate = this.nearestMvCandidate(b.ref0, bx4, by4, haveTop, haveLeft)
-    b.mvX = candidate.x
-    b.mvY = candidate.y
-
-    // The mode context is zero when the candidate stack is empty, and the
-    // nearest spatial candidate supplies the low-context mode otherwise.
-    const modeContext = candidate.found ? 16 : 8
-    if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('newmv_mode', modeContext & 7))) {
+    const { stack, count: candidateCount, context: modeContext } = this.buildMvCandidates(
+      b.ref0,
+      bs,
+      bw4,
+      bh4,
+      bx4,
+      by4,
+      haveTop,
+      haveLeft,
+    )
+    let candidateIndex = 0
+    const newMvMode = this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('newmv_mode', modeContext & 7))
+    if (newMvMode) {
       if (!this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('globalmv_mode', (modeContext >> 3) & 1))) {
         b.mvX = b.mvY = 0
       }
       else if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('refmv_mode', (modeContext >> 4) & 15))) {
-        // NEARMV uses a later candidate. A complete temporal candidate stack
-        // is required when no second spatial candidate exists.
-        throw new Error('ts-avif: near-motion inter candidates are not implemented')
+        candidateIndex = 1
+        if (candidateCount > 2) {
+          candidateIndex += this.msac.decodeBoolAdapt(
+            this.cdf.data,
+            this.cdf.offset('drl_bit', this.drlContext(stack, 1)),
+          )
+          if (candidateIndex === 2 && candidateCount > 3) {
+            candidateIndex += this.msac.decodeBoolAdapt(
+              this.cdf.data,
+              this.cdf.offset('drl_bit', this.drlContext(stack, 2)),
+            )
+          }
+        }
+        const mv = stack[candidateIndex] ?? { x: 0, y: 0 }
+        b.mvX = mv.x
+        b.mvY = mv.y
+        this.fixMvPrecision(b)
+      }
+      else {
+        const mv = stack[0] ?? { x: 0, y: 0 }
+        b.mvX = mv.x
+        b.mvY = mv.y
+        this.fixMvPrecision(b)
       }
     }
     else {
-      this.readMvResidual(b)
+      b.newMv = 1
+      if (candidateCount > 1) {
+        candidateIndex += this.msac.decodeBoolAdapt(
+          this.cdf.data,
+          this.cdf.offset('drl_bit', this.drlContext(stack, 0)),
+        )
+        if (candidateIndex === 1 && candidateCount > 2) {
+          candidateIndex += this.msac.decodeBoolAdapt(
+            this.cdf.data,
+            this.cdf.offset('drl_bit', this.drlContext(stack, 1)),
+          )
+        }
+      }
+      const mv = stack[candidateIndex] ?? { x: 0, y: 0 }
+      b.mvX = mv.x
+      b.mvY = mv.y
+      this.fixMvPrecision(b)
+      this.readMvResidual(b, this.hdr.forceIntegerMv ? -1 : this.hdr.allowHighPrecisionMv ? 1 : 0)
     }
 
     if (this.hdr.interpolationFilter === 4 && (b.mvX & 7 || b.mvY & 7))
       throw new Error('ts-avif: switchable sub-pixel inter filters are not implemented')
-    if (b.mvX & 7 || b.mvY & 7)
-      throw new Error('ts-avif: sub-pixel inter prediction is not implemented')
 
     b.yMode = IntraPredMode.DC_PRED
     b.uvMode = IntraPredMode.DC_PRED
-    b.tx = MAX_TXFM_SIZE_FOR_BS[bs * 4]
-    b.uvtx = MAX_TXFM_SIZE_FOR_BS[bs * 4 + this.layout]
-    if (!b.skip && this.hdr.txMode === 2)
-      throw new Error('ts-avif: variable transform trees for coded inter blocks are not implemented')
-    this.reconBIntra(bs, b, w4, h4, cbw4, cbh4, hasChroma, 0)
+    this.readVarTxTree(bs, b, bw4, bh4, bx4, by4)
+    this.reconBInter(bs, b, w4, h4, cbw4, cbh4, hasChroma)
     this.updateInterContexts(bs, b, bw4, bh4, cbw4, cbh4, hasChroma, bx4, by4)
   }
 
   private readSingleReference(bx4: number, by4: number, haveTop: boolean, haveLeft: boolean): number {
-    const ctx1 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref >= 4)
+    const refs = this.neighborReferences(bx4, by4, haveTop, haveLeft)
+    const ctx1 = binaryCountContext(
+      refs.filter(ref => ref < 4).length,
+      refs.filter(ref => ref >= 4).length,
+    )
     if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 0, ctx1))) {
-      const ctx2 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 6)
+      const backward = refs.filter(ref => ref >= 4)
+      const ctx2 = binaryCountContext(
+        backward.filter(ref => ref < 6).length,
+        backward.filter(ref => ref === 6).length,
+      )
       if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 1, ctx2)))
         return 6
-      const ctx3 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 5)
+      const ctx3 = binaryCountContext(
+        backward.filter(ref => ref === 4).length,
+        backward.filter(ref => ref === 5).length,
+      )
       return 4 + this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 5, ctx3))
     }
-    const ctx2 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref >= 2 && ref < 4)
+    const forward = refs.filter(ref => ref < 4)
+    const ctx2 = binaryCountContext(
+      forward.filter(ref => ref < 2).length,
+      forward.filter(ref => ref >= 2).length,
+    )
     if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 2, ctx2))) {
-      const ctx3 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 3)
+      const ctx3 = binaryCountContext(
+        forward.filter(ref => ref === 2).length,
+        forward.filter(ref => ref === 3).length,
+      )
       return 2 + this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 4, ctx3))
     }
-    const ctx3 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 1)
+    const ctx3 = binaryCountContext(
+      forward.filter(ref => ref === 0).length,
+      forward.filter(ref => ref === 1).length,
+    )
     return this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 3, ctx3))
   }
 
-  private referenceContext(
+  private neighborReferences(
     bx4: number,
     by4: number,
     haveTop: boolean,
     haveLeft: boolean,
-    test: (ref: number) => boolean,
-  ): number {
-    let yes = 0
-    let no = 0
-    const count = (ctx: BlockContext, off: number): void => {
+  ): number[] {
+    const refs: number[] = []
+    const append = (ctx: BlockContext, off: number): void => {
       if (ctx.intra[off]) return
-      ;(test(ctx.ref0[off]) ? yes++ : no++)
-      if (ctx.compType[off]) (test(ctx.ref1[off]) ? yes++ : no++)
+      refs.push(ctx.ref0[off])
+      if (ctx.compType[off]) refs.push(ctx.ref1[off])
     }
-    if (haveTop) count(this.a, bx4)
-    if (haveLeft) count(this.l, by4)
-    return yes === no ? 1 : yes > no ? 0 : 2
+    if (haveTop) append(this.a, bx4)
+    if (haveLeft) append(this.l, by4)
+    return refs
   }
 
   private compContext(bx4: number, by4: number, haveTop: boolean, haveLeft: boolean): number {
@@ -985,18 +1090,112 @@ export class TileDecoder {
     return (haveTop ? this.a.ref0[bx4] : this.l.ref0[by4]) >= 4 ? 1 : 0
   }
 
-  private nearestMvCandidate(
+  private buildMvCandidates(
     ref: number,
+    _bs: BlockSize,
+    bw4: number,
+    bh4: number,
     bx4: number,
     by4: number,
     haveTop: boolean,
     haveLeft: boolean,
-  ): { x: number, y: number, found: boolean } {
-    if (haveLeft && this.l.ref0[by4] === ref)
-      return { x: this.l.mvX[by4], y: this.l.mvY[by4], found: true }
-    if (haveTop && this.a.ref0[bx4] === ref)
-      return { x: this.a.mvX[bx4], y: this.a.mvY[bx4], found: true }
-    return { x: 0, y: 0, found: false }
+  ): { stack: Array<{ x: number, y: number, weight: number }>, count: number, context: number } {
+    const stack: Array<{ x: number, y: number, weight: number }> = []
+    let rowMatch = 0
+    let colMatch = 0
+    let haveNewMv = 0
+    const add = (x: number, y: number, weight: number, isNew: number): void => {
+      const existing = stack.find(candidate => candidate.x === x && candidate.y === y)
+      if (existing) existing.weight += weight
+      else stack.push({ x, y, weight })
+      haveNewMv |= isNew
+    }
+    if (haveTop) {
+      const off = (by4 - 1) * this.bw4 + bx4
+      if (this.interRef[off] === ref) {
+        rowMatch = 1
+        add(this.interMvX[off], this.interMvY[off], Math.min(bw4, 16) * 4 + 640, this.interNewMv[off])
+      }
+    }
+    if (haveLeft) {
+      const off = by4 * this.bw4 + bx4 - 1
+      if (this.interRef[off] === ref) {
+        colMatch = 1
+        add(this.interMvX[off], this.interMvY[off], Math.min(bh4, 16) * 4 + 640, this.interNewMv[off])
+      }
+    }
+    // A decoded top-right block participates in the nearest row scan. The
+    // frame map naturally excludes unavailable top-right regions because
+    // their reference entry is still -1 at this point in partition order.
+    if (haveTop && Math.max(bw4, bh4) <= 16 && bx4 + bw4 < this.bw4) {
+      const off = (by4 - 1) * this.bw4 + bx4 + bw4
+      if (this.interRef[off] === ref) {
+        rowMatch = 1
+        add(this.interMvX[off], this.interMvY[off], 4 + 640, this.interNewMv[off])
+      }
+    }
+    const nearestMatch = rowMatch + colMatch
+    let anyRowMatch = rowMatch
+    let anyColMatch = colMatch
+    const addSecondary = (x: number, y: number, weight: number, row: boolean): void => {
+      if (x < 0 || y < 0 || x >= this.bw4 || y >= this.bh4) return
+      const off = y * this.bw4 + x
+      if (this.interRef[off] !== ref) return
+      if (row) anyRowMatch = 1
+      else anyColMatch = 1
+      // Secondary candidates do not contribute to the NEWMV nearest-match
+      // flag, but they remain ordered after the 640-weight nearest group.
+      add(this.interMvX[off], this.interMvY[off], weight, 0)
+    }
+    if (haveTop && haveLeft)
+      addSecondary(bx4 - 1, by4 - 1, 4, true)
+    for (const distance of [3, 5]) {
+      if (by4 >= distance)
+        addSecondary(bx4 | 1, by4 - distance, Math.max(2, Math.min(bw4, 16) * 2), true)
+      if (bx4 >= distance)
+        addSecondary(bx4 - distance, by4 | 1, Math.max(2, Math.min(bh4, 16) * 2), false)
+    }
+    const refMatchCount = anyRowMatch + anyColMatch
+    let refMvContext: number
+    let newMvContext: number
+    if (nearestMatch === 0) {
+      refMvContext = Math.min(2, refMatchCount)
+      newMvContext = refMatchCount > 0 ? 1 : 0
+    }
+    else if (nearestMatch === 1) {
+      refMvContext = Math.min(refMatchCount * 3, 4)
+      newMvContext = 3 - haveNewMv
+    }
+    else {
+      refMvContext = 5
+      newMvContext = 5 - haveNewMv
+    }
+    stack.sort((a, c) => c.weight - a.weight)
+    const count = stack.length
+    while (stack.length < 2) stack.push({ x: 0, y: 0, weight: 2 })
+    const globalMvContext = this.hdr.useRefFrameMvs ? 1 : 0
+    return {
+      stack,
+      count,
+      context: (refMvContext << 4) | (globalMvContext << 3) | newMvContext,
+    }
+  }
+
+  private drlContext(stack: Array<{ weight: number }>, index: number): number {
+    if (stack[index].weight >= 640)
+      return stack[index + 1].weight < 640 ? 1 : 0
+    return stack[index + 1].weight < 640 ? 2 : 0
+  }
+
+  private fixMvPrecision(b: Av1Block): void {
+    if (this.hdr.forceIntegerMv) {
+      b.mvX = (b.mvX - (b.mvX >> 15) + 3) & ~7
+      b.mvY = (b.mvY - (b.mvY >> 15) + 3) & ~7
+    }
+    else if (!this.hdr.allowHighPrecisionMv) {
+      b.mvX = (b.mvX - (b.mvX >> 15)) & ~1
+      b.mvY = (b.mvY - (b.mvY >> 15)) & ~1
+    }
   }
 
   private updateInterContexts(
@@ -1010,11 +1209,9 @@ export class TileDecoder {
     bx4: number,
     by4: number,
   ): void {
-    const tDim = TXFM_INFO[b.tx]
     for (let i = 0; i < bw4; i++) {
       const o = bx4 + i
       this.a.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 2]
-      this.a.tx[o] = tDim.lw
       this.a.mode[o] = 0
       this.a.palSz[o] = this.a.palSzUv[o] = 0
       this.a.segPred[o] = 0
@@ -1030,7 +1227,6 @@ export class TileDecoder {
     for (let i = 0; i < bh4; i++) {
       const o = by4 + i
       this.l.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 3]
-      this.l.tx[o] = tDim.lh
       this.l.mode[o] = 0
       this.l.palSz[o] = this.l.palSzUv[o] = 0
       this.l.segPred[o] = 0
@@ -1047,6 +1243,234 @@ export class TileDecoder {
       this.a.uvmode.fill(IntraPredMode.DC_PRED, bx4 >> this.ssHor, (bx4 >> this.ssHor) + cbw4)
       this.l.uvmode.fill(IntraPredMode.DC_PRED, by4 >> this.ssVer, (by4 >> this.ssVer) + cbh4)
     }
+    const width = Math.min(bw4, this.bw4 - this.bx)
+    const height = Math.min(bh4, this.bh4 - this.by)
+    for (let y = 0; y < height; y++) {
+      const off = (this.by + y) * this.bw4 + this.bx
+      this.interRef.fill(b.ref0, off, off + width)
+      this.interMvX.fill(b.mvX, off, off + width)
+      this.interMvY.fill(b.mvY, off, off + width)
+      this.interNewMv.fill(b.newMv, off, off + width)
+      this.interBs.fill(bs, off, off + width)
+    }
+  }
+
+  private readVarTxTree(
+    bs: BlockSize,
+    b: Av1Block,
+    bw4: number,
+    bh4: number,
+    bx4: number,
+    by4: number,
+  ): void {
+    b.txSplit0 = b.txSplit1 = 0
+    b.tx = MAX_TXFM_SIZE_FOR_BS[bs * 4]
+    if (!b.skip && (this.hdr.losslessArray[b.segId] || b.tx === TxfmSize.TX_4X4)) {
+      b.tx = b.uvtx = TxfmSize.TX_4X4
+      if (this.hdr.txMode === 2) {
+        this.a.tx.fill(0, bx4, bx4 + bw4)
+        this.l.tx.fill(0, by4, by4 + bh4)
+      }
+      return
+    }
+    b.uvtx = MAX_TXFM_SIZE_FOR_BS[bs * 4 + this.layout]
+    if (this.hdr.txMode !== 2 || b.skip) {
+      if (this.hdr.txMode === 2) {
+        this.a.tx.fill(BLOCK_DIMENSIONS[bs * 4 + 2], bx4, bx4 + bw4)
+        this.l.tx.fill(BLOCK_DIMENSIONS[bs * 4 + 3], by4, by4 + bh4)
+      }
+      return
+    }
+
+    const maxTx = TXFM_INFO[b.tx]
+    let y = 0
+    let yOff = 0
+    for (y = 0, yOff = 0; y < bh4; y += maxTx.h, yOff++) {
+      let x = 0
+      let xOff = 0
+      for (x = 0, xOff = 0; x < bw4; x += maxTx.w, xOff++) {
+        this.readTxTree(b.tx, 0, b, xOff, yOff)
+        this.bx += maxTx.w
+      }
+      this.bx -= x
+      this.by += maxTx.h
+    }
+    this.by -= y
+  }
+
+  private readTxTree(from: number, depth: number, b: Av1Block, xOff: number, yOff: number): void {
+    const tDim = TXFM_INFO[from]
+    const bx4 = this.bx
+    const by4 = this.by & 31
+    let split = 0
+    if (depth < 2 && from > TxfmSize.TX_4X4) {
+      const category = 2 * (TxfmSize.TX_64X64 - tDim.max) - depth
+      const context = (this.a.tx[bx4] < tDim.lw ? 1 : 0)
+        + (this.l.tx[by4] < tDim.lh ? 1 : 0)
+      split = this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('txpart', category, context))
+      if (split) {
+        if (depth === 0) b.txSplit0 |= 1 << (yOff * 4 + xOff)
+        else b.txSplit1 |= 1 << (yOff * 4 + xOff)
+      }
+    }
+    if (split && tDim.max > TxfmSize.TX_8X8) {
+      const sub = tDim.sub
+      const subDim = TXFM_INFO[sub]
+      this.readTxTree(sub, depth + 1, b, xOff * 2, yOff * 2)
+      this.bx += subDim.w
+      if (tDim.lw >= tDim.lh && this.bx < this.bw4)
+        this.readTxTree(sub, depth + 1, b, xOff * 2 + 1, yOff * 2)
+      this.bx -= subDim.w
+      this.by += subDim.h
+      if (tDim.lh >= tDim.lw && this.by < this.bh4) {
+        this.readTxTree(sub, depth + 1, b, xOff * 2, yOff * 2 + 1)
+        this.bx += subDim.w
+        if (tDim.lw >= tDim.lh && this.bx < this.bw4)
+          this.readTxTree(sub, depth + 1, b, xOff * 2 + 1, yOff * 2 + 1)
+        this.bx -= subDim.w
+      }
+      this.by -= subDim.h
+    }
+    else {
+      this.a.tx.fill(split ? 0 : tDim.lw, bx4, bx4 + tDim.w)
+      this.l.tx.fill(split ? 0 : tDim.lh, by4, by4 + tDim.h)
+    }
+  }
+
+  private reconBInter(
+    bs: BlockSize,
+    b: Av1Block,
+    w4: number,
+    h4: number,
+    cbw4: number,
+    cbh4: number,
+    hasChroma: boolean,
+  ): void {
+    const bx4 = this.bx
+    const by4 = this.by & 31
+    const ssHor = this.ssHor
+    const ssVer = this.ssVer
+    const cbx4 = bx4 >> ssHor
+    const cby4 = by4 >> ssVer
+    const maxTx = TXFM_INFO[b.tx]
+    const uvTx = TXFM_INFO[b.uvtx]
+    const cw4 = (w4 + ssHor) >> ssHor
+    const ch4 = (h4 + ssVer) >> ssVer
+
+    this.recon?.startBlock(bs, b, this)
+    if (b.skip) {
+      this.a.lcoef.fill(0x40, bx4, bx4 + BLOCK_DIMENSIONS[bs * 4])
+      this.l.lcoef.fill(0x40, by4, by4 + BLOCK_DIMENSIONS[bs * 4 + 1])
+      if (hasChroma) {
+        for (let pl = 0; pl < 2; pl++) {
+          this.a.ccoef[pl].fill(0x40, cbx4, cbx4 + cbw4)
+          this.l.ccoef[pl].fill(0x40, cby4, cby4 + cbh4)
+        }
+      }
+      return
+    }
+
+    for (let initY = 0; initY < h4; initY += 16) {
+      for (let initX = 0; initX < w4; initX += 16) {
+        let y = initY
+        let yOff = initY ? 1 : 0
+        for (y = initY, this.by += initY; y < Math.min(h4, initY + 16); y += maxTx.h, yOff++) {
+          let x = initX
+          let xOff = initX ? 1 : 0
+          for (x = initX, this.bx += initX; x < Math.min(w4, initX + 16); x += maxTx.w, xOff++) {
+            this.reconInterTxTree(bs, b, b.tx, 0, xOff, yOff)
+            this.bx += maxTx.w
+          }
+          this.bx -= x
+          this.by += maxTx.h
+        }
+        this.by -= y
+
+        if (!hasChroma) continue
+        const subCh4 = Math.min(ch4, (initY + 16) >> ssVer)
+        const subCw4 = Math.min(cw4, (initX + 16) >> ssHor)
+        for (let pl = 0; pl < 2; pl++) {
+          for (y = initY >> ssVer, this.by += initY; y < subCh4;
+            y += uvTx.h, this.by += uvTx.h << ssVer) {
+            let x = initX >> ssHor
+            for (x = initX >> ssHor, this.bx += initX; x < subCw4;
+              x += uvTx.w, this.bx += uvTx.w << ssHor) {
+              this.cf.fill(0)
+              const { eob, txtp, ctx } = this.decodeCoefs(
+                this.a.ccoef[pl],
+                cbx4 + x,
+                this.l.ccoef[pl],
+                cby4 + y,
+                b.uvtx,
+                bs,
+                b,
+                0,
+                1 + pl,
+                this.txtpMap[((by4 + (y << ssVer)) & 31) * 32 + bx4 + (x << ssHor)],
+              )
+              const ctw = Math.min(uvTx.w, (this.bw4 - this.bx + ssHor) >> ssHor)
+              const cth = Math.min(uvTx.h, (this.bh4 - this.by + ssVer) >> ssVer)
+              this.a.ccoef[pl].fill(ctx, cbx4 + x, cbx4 + x + ctw)
+              this.l.ccoef[pl].fill(ctx, cby4 + y, cby4 + y + cth)
+              this.recon?.reconTxBlock(1 + pl, this.bx >> ssHor, this.by >> ssVer, b.uvtx, txtp, eob, this.cf, b, this, 0)
+            }
+            this.bx -= x << ssHor
+          }
+          this.by -= y << ssVer
+        }
+      }
+    }
+  }
+
+  private reconInterTxTree(
+    bs: BlockSize,
+    b: Av1Block,
+    tx: number,
+    depth: number,
+    xOff: number,
+    yOff: number,
+  ): void {
+    const tDim = TXFM_INFO[tx]
+    const mask = depth === 0 ? b.txSplit0 : b.txSplit1
+    if (depth < 2 && (mask & (1 << (yOff * 4 + xOff)))) {
+      const sub = tDim.sub
+      const subDim = TXFM_INFO[sub]
+      this.reconInterTxTree(bs, b, sub, depth + 1, xOff * 2, yOff * 2)
+      this.bx += subDim.w
+      if (tDim.lw >= tDim.lh && this.bx < this.bw4)
+        this.reconInterTxTree(bs, b, sub, depth + 1, xOff * 2 + 1, yOff * 2)
+      this.bx -= subDim.w
+      this.by += subDim.h
+      if (tDim.lh >= tDim.lw && this.by < this.bh4) {
+        this.reconInterTxTree(bs, b, sub, depth + 1, xOff * 2, yOff * 2 + 1)
+        this.bx += subDim.w
+        if (tDim.lw >= tDim.lh && this.bx < this.bw4)
+          this.reconInterTxTree(bs, b, sub, depth + 1, xOff * 2 + 1, yOff * 2 + 1)
+        this.bx -= subDim.w
+      }
+      this.by -= subDim.h
+      return
+    }
+
+    const x = this.bx & 31
+    const y = this.by & 31
+    this.cf.fill(0)
+    const { eob, txtp, ctx } = this.decodeCoefs(
+      this.a.lcoef,
+      this.bx,
+      this.l.lcoef,
+      y,
+      tx,
+      bs,
+      b,
+      0,
+      0,
+    )
+    this.a.lcoef.fill(ctx, this.bx, this.bx + Math.min(tDim.w, this.bw4 - this.bx))
+    this.l.lcoef.fill(ctx, y, y + Math.min(tDim.h, this.bh4 - this.by))
+    for (let row = 0; row < tDim.h; row++)
+      this.txtpMap.fill(txtp, ((y + row) & 31) * 32 + x, ((y + row) & 31) * 32 + x + tDim.w)
+    this.recon?.reconTxBlock(0, this.bx, this.by, tx, txtp, eob, this.cf, b, this, 0)
   }
 
   /** Decode and reconstruct an intra-block-copy block in an intra frame. */
@@ -1137,30 +1561,41 @@ export class TileDecoder {
     }
   }
 
-  private readMvResidual(b: Av1Block): void {
+  private readMvResidual(b: Av1Block, precision = -1): void {
     // MVJoint values are 0, horizontal, vertical, horizontal+vertical.
     const joint = this.msac.decodeSymbol(this.cdf.data, this.cdf.offset('mv_joint'), 3)
     if (joint & 2)
-      b.mvY += this.readMvComponent(0)
+      b.mvY += this.readMvComponent(0, precision)
     if (joint & 1)
-      b.mvX += this.readMvComponent(1)
+      b.mvX += this.readMvComponent(1, precision)
   }
 
-  private readMvComponent(component: 0 | 1): number {
+  private readMvComponent(component: 0 | 1, precision: number): number {
     const cdf = this.mvCdf[component]
     const sign = this.msac.decodeBoolAdapt(cdf, 16)
     const mvClass = this.msac.decodeSymbol(cdf, 0, 10)
     let up: number
     if (mvClass === 0) {
       up = this.msac.decodeBoolAdapt(cdf, 18)
+      let fp = 3
+      let hp = 1
+      if (precision >= 0) {
+        fp = this.msac.decodeSymbol(cdf, 20 + up * 4, 3)
+        if (precision > 0) hp = this.msac.decodeBoolAdapt(cdf, 28)
+      }
+      const diff = (up << 3 | fp << 1 | hp) + 1
+      return sign ? -diff : diff
     }
-    else {
-      up = 1 << mvClass
-      for (let bit = 0; bit < mvClass; bit++)
-        up |= this.msac.decodeBoolAdapt(cdf, 30 + bit * 2) << bit
+    up = 1 << mvClass
+    for (let bit = 0; bit < mvClass; bit++)
+      up |= this.msac.decodeBoolAdapt(cdf, 30 + bit * 2) << bit
+    let fp = 3
+    let hp = 1
+    if (precision >= 0) {
+      fp = this.msac.decodeSymbol(cdf, 52, 3)
+      if (precision > 0) hp = this.msac.decodeBoolAdapt(cdf, 56)
     }
-    // Intrabc forces integer precision, so the fractional bits are 0b111.
-    const diff = (up << 3 | 7) + 1
+    const diff = (up << 3 | fp << 1 | hp) + 1
     return sign ? -diff : diff
   }
 
@@ -1533,6 +1968,7 @@ export class TileDecoder {
     b: Av1Block,
     intra: number,
     plane: number,
+    interLumaTxtp = TxfmType.DCT_DCT,
   ): { eob: number, txtp: number, ctx: number } {
     const { msac, cdf, hdr } = this
     const chroma = plane ? 1 : 0
@@ -1560,7 +1996,7 @@ export class TileDecoder {
       txtp = TxfmType.DCT_DCT
     }
     else if (chroma) {
-      txtp = TXTP_FROM_UVMODE[b.uvMode]
+      txtp = intra ? TXTP_FROM_UVMODE[b.uvMode] : uvInterTxtp(tDim, interLumaTxtp)
     }
     else if (hdr.segQIndex[b.segId] === 0) {
       txtp = TxfmType.DCT_DCT
@@ -1569,7 +2005,21 @@ export class TileDecoder {
       const yModeNofilt = b.yMode === IntraPredMode.FILTER_PRED
         ? FILTER_MODE_TO_Y_MODE_LOCAL[b.yAngle]
         : b.yMode
-      if (hdr.reducedTxSet || tDim.min === TxfmSize.TX_16X16) {
+      if (!intra) {
+        if (hdr.reducedTxSet || tDim.max === TxfmSize.TX_32X32) {
+          const idx = msac.decodeBoolAdapt(cdf.data, cdf.offset('txtp_inter3', tDim.min))
+          txtp = idx ? TxfmType.DCT_DCT : TxfmType.IDTX
+        }
+        else if (tDim.min === TxfmSize.TX_16X16) {
+          const idx = msac.decodeSymbol(cdf.data, cdf.offset('txtp_inter2'), 11)
+          txtp = TX_TYPES_PER_SET[idx + 12]
+        }
+        else {
+          const idx = msac.decodeSymbol(cdf.data, cdf.offset('txtp_inter1', tDim.min), 15)
+          txtp = TX_TYPES_PER_SET[idx + 24]
+        }
+      }
+      else if (hdr.reducedTxSet || tDim.min === TxfmSize.TX_16X16) {
         const idx = msac.decodeSymbol(cdf.data, cdf.offset('txtp_intra2', tDim.min, yModeNofilt), 4)
         txtp = TX_TYPES_PER_SET[idx]
       }
