@@ -37,12 +37,26 @@ const vectors = JSON.parse(
   readFileSync(join(import.meta.dir, 'fixtures', 'ipred-vectors.json'), 'utf8'),
 ) as PredVector[]
 
-function makeLcg(seed: number) {
+// Fills a plane with the same deterministic LCG stream the reference harness
+// used. Inlined (rather than a per-byte closure call) so the ~300M-iteration
+// plane regeneration across all vectors stays well under the CI test timeout on
+// slower x64 runners; the produced bytes are identical to the original closure.
+function fillPlane(plane: Uint8Array, seed: number): number {
   let rng = seed >>> 0
-  return () => {
+  for (let i = 0; i < 256 * 256; i++) {
     rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0
-    return rng >>> 8
+    plane[i] = (rng >>> 8) & 0xFF
   }
+  return rng
+}
+
+function fillPlaneFrom(plane: Uint8Array, rngIn: number): number {
+  let rng = rngIn >>> 0
+  for (let i = 0; i < 256 * 256; i++) {
+    rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0
+    plane[i] = (rng >>> 8) & 0xFF
+  }
+  return rng
 }
 
 function fnv(plane: Uint8Array, off: number, stride: number, w: number, h: number): string {
@@ -67,10 +81,8 @@ describe('intra prediction vs dav1d reference vectors', () => {
     let checked = 0
 
     for (const v of vectors) {
-      const next = makeLcg(v.seed)
       if (v.op === 'P') {
-        for (let i = 0; i < 256 * 256; i++)
-          plane[i] = next() & 0xFF
+        fillPlane(plane, v.seed)
         const dstOff = v.y4 * 4 * stride + v.x4 * 4
         const prep = prepareIntraEdges(
           v.x4,
@@ -115,10 +127,8 @@ describe('intra prediction vs dav1d reference vectors', () => {
         }
       }
       else {
-        for (let i = 0; i < 256 * 256; i++)
-          plane[i] = next() & 0xFF
-        for (let i = 0; i < 256 * 256; i++)
-          plane2[i] = next() & 0xFF
+        const rng = fillPlane(plane, v.seed)
+        fillPlaneFrom(plane2, rng)
         cflAc(
           ac,
           plane,
@@ -164,5 +174,5 @@ describe('intra prediction vs dav1d reference vectors', () => {
       checked++
     }
     expect(checked).toBe(vectors.length)
-  })
+  }, 30000)
 })
