@@ -15,6 +15,141 @@ import { floorLog2 } from './bits'
 const EC_PROB_SHIFT = 6
 const EC_MIN_PROB = 4
 
+/** AV1 multi-symbol arithmetic encoder, the inverse of `SymbolDecoder`. */
+export class SymbolEncoder {
+  private rng = 0x8000
+  private cnt = -9
+  private low = 0
+  private precarry: number[] = []
+  readonly allowUpdateCdf: boolean
+
+  constructor(disableCdfUpdate: boolean) {
+    this.allowUpdateCdf = !disableCdfUpdate
+  }
+
+  private store(fl: number, fh: number, nms: number): void {
+    const r = this.rng
+    let u = (((r >>> 8) * (fl >>> EC_PROB_SHIFT)) >>> (7 - EC_PROB_SHIFT))
+      + EC_MIN_PROB * nms
+    if (fl >= 32768)
+      u = r
+    const v = (((r >>> 8) * (fh >>> EC_PROB_SHIFT)) >>> (7 - EC_PROB_SHIFT))
+      + EC_MIN_PROB * (nms - 1)
+    const nextRng = u - v
+
+    let low = (this.low + r - u) >>> 0
+    let c = this.cnt
+    const d = Math.clz32(nextRng) - 16
+    let s = c + d
+    if (s >= 0) {
+      c += 16
+      let mask = 2 ** c - 1
+      if (s >= 8) {
+        this.precarry.push(low >>> c)
+        low = (low & mask) >>> 0
+        c -= 8
+        mask = Math.floor(mask / 256)
+      }
+      this.precarry.push(low >>> c)
+      s = c + d - 24
+      low = (low & mask) >>> 0
+    }
+
+    this.low = (low << d) >>> 0
+    this.rng = nextRng << d
+    this.cnt = s
+  }
+
+  /** Encode a symbol from an N-symbol inverse CDF (N-1 values + count). */
+  encodeSymbol(cdf: Uint16Array, off: number, nSymbolsMinus1: number, symbol: number): void {
+    if (symbol < 0 || symbol > nSymbolsMinus1)
+      throw new RangeError(`symbol ${symbol} outside 0..${nSymbolsMinus1}`)
+    const fl = symbol > 0 ? cdf[off + symbol - 1] : 32768
+    const fh = symbol < nSymbolsMinus1 ? cdf[off + symbol] : 0
+    this.store(fl, fh, nSymbolsMinus1 + 1 - symbol)
+    if (this.allowUpdateCdf)
+      updateCdf(cdf, off, nSymbolsMinus1, symbol)
+  }
+
+  /** Encode a fixed-probability boolean (`f` is Q15 P(bit == 1)). */
+  encodeBool(bit: number, f: number): void {
+    if (bit !== 0 && bit !== 1)
+      throw new RangeError(`boolean symbol must be 0 or 1, got ${bit}`)
+    if (f <= 0 || f >= 32768)
+      throw new RangeError(`boolean probability must be in 1..32767, got ${f}`)
+    if (bit)
+      this.store(f, 0, 1)
+    else
+      this.store(32768, f, 2)
+  }
+
+  encodeBoolAdapt(cdf: Uint16Array, off: number, bit: number): void {
+    this.encodeBool(bit, cdf[off])
+    if (this.allowUpdateCdf)
+      updateCdf(cdf, off, 1, bit)
+  }
+
+  encodeBoolEqui(bit: number): void {
+    this.encodeBool(bit, 16384)
+  }
+
+  writeLiteral(value: number, bits: number): void {
+    if (!Number.isSafeInteger(value) || value < 0 || value >= 2 ** bits)
+      throw new RangeError(`literal ${value} does not fit in ${bits} bits`)
+    for (let bit = bits - 1; bit >= 0; bit--)
+      this.encodeBoolEqui(Math.floor(value / 2 ** bit) & 1)
+  }
+
+  writeGolomb(value: number): void {
+    if (!Number.isSafeInteger(value) || value < 0)
+      throw new RangeError(`invalid Golomb value ${value}`)
+    const x = value + 1
+    const length = Math.floor(Math.log2(x)) + 1
+    for (let i = 1; i < length; i++)
+      this.encodeBoolEqui(0)
+    this.writeLiteral(x, length)
+  }
+
+  /** Finish the arithmetic code and return the minimum unambiguous byte stream. */
+  finish(): Uint8Array {
+    let c = this.cnt
+    let s = 10 + c
+    const mask = 0x3FFF
+    let e = (((this.low + mask) & ~mask) | (mask + 1)) >>> 0
+
+    if (s > 0) {
+      let n = 2 ** (c + 16) - 1
+      do {
+        this.precarry.push(e >>> (c + 16))
+        e = (e & n) >>> 0
+        s -= 8
+        c -= 8
+        n = Math.floor(n / 256)
+      } while (s > 0)
+    }
+
+    const out = new Uint8Array(this.precarry.length)
+    let carry = 0
+    for (let i = this.precarry.length - 1; i >= 0; i--) {
+      carry += this.precarry[i]
+      out[i] = carry & 0xFF
+      carry >>>= 8
+    }
+    return out
+  }
+}
+
+function updateCdf(cdf: Uint16Array, off: number, nSymbolsMinus1: number, symbol: number): void {
+  const count = cdf[off + nSymbolsMinus1]
+  const rate = 4 + (count >> 4) + (nSymbolsMinus1 > 2 ? 1 : 0)
+  let i = 0
+  for (; i < symbol; i++)
+    cdf[off + i] += (32768 - cdf[off + i]) >> rate
+  for (; i < nSymbolsMinus1; i++)
+    cdf[off + i] -= cdf[off + i] >> rate
+  cdf[off + nSymbolsMinus1] = count + (count < 32 ? 1 : 0)
+}
+
 export class SymbolDecoder {
   /** Range, always in [0x8000, 0xFFFF] between symbols. */
   private rng = 0x8000
