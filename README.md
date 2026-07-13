@@ -7,8 +7,8 @@ A pure TypeScript AVIF encoder and decoder with zero native dependencies.
 - 🚀 Pure TypeScript - no native dependencies
 - 📦 Zero dependencies
 - 🎨 HEIF/ISOBMFF container support
-- 🔄 AV1 still image codec
-- 📐 Alpha channel support
+- 🔄 8-bit AV1 still-image decoder
+- ✍️ Bundled 8-bit intra encoder (no `avifenc` subprocess)
 
 ## Installation
 
@@ -45,7 +45,7 @@ const imageData = {
 
 const avifBuffer = encode(imageData, {
   quality: 80,
-  lossless: false,
+  chromaSubsampling: '4:2:0',
 })
 await Bun.write('output.avif', avifBuffer)
 ```
@@ -96,10 +96,10 @@ Encodes RGBA pixel data to AVIF format.
 **Options:**
 
 - `quality?: number` - Quality (0-100, default: 80)
-- `lossless?: boolean` - Use lossless encoding
-- `effort?: number` - Speed/effort trade-off (0-10, default: 6)
-- `alpha?: boolean` - Enable alpha channel
-- `chromaSubsampling?: '4:2:0' | '4:2:2' | '4:4:4'` - Chroma subsampling
+- `lossless?: boolean` - Reserved; currently throws when enabled
+- `effort?: number` - Reserved speed/effort trade-off
+- `alpha?: boolean` - Reserved; currently throws when enabled
+- `chromaSubsampling?: '4:2:0'` - The current encoder output format
 
 ## Container Format
 
@@ -116,19 +116,20 @@ The library fully supports parsing HEIF/ISOBMFF container format:
 
 ## Technical Notes
 
-This is a pure TypeScript implementation of AVIF decoding and encoding. AV1 is a complex codec, and this implementation focuses on still image support (AVIF).
+This is a pure TypeScript AVIF implementation focused on 8-bit intra still images. The encoder writes real AV1 sequence, frame, partition, mode, and coefficient syntax using adaptive arithmetic coding; it does not shell out to a native codec.
 
 Key components:
 
 - HEIF container parsing (ISO Base Media File Format)
 - AV1 OBU (Open Bitstream Unit) parsing
-- AV1 sequence header and frame decoding framework
+- Bit-exact AV1 intra prediction, inverse transforms, deblocking, CDEF, and loop restoration
+- 4×4 DC-predicted DCT encoder with full-range BT.709 4:2:0 output
 
 ## Limitations
 
-- Full AV1 decoding is complex; this is a foundation implementation
-- Animation support is not yet implemented
-- Some advanced AV1 features may not be fully supported
+- The encoder accepts opaque 8-bit RGBA images up to 4096×2304. Alpha, lossless mode, and 4:2:2/4:4:4 encoding throw explicitly.
+- The decoder supports the 8-bit intra path. 10/12-bit, inter frames, intra-block copy, palette, film grain, quantizer matrices, super-resolution, and 128×128 superblocks throw explicitly.
+- Animation is not implemented.
 
 ## License
 
