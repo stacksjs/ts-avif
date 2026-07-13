@@ -36,6 +36,7 @@ export const MODE_OFFSETS = {
   pal_y: [2356, 7, 3, 2],
   pal_uv: [2398, 2, 2],
   intrabc: [2402, 2],
+  filter: [2688, 2, 8, 4],
   skip_mode: [2856, 3, 2],
   newmv_mode: [2862, 6, 2],
   globalmv_mode: [2874, 2, 2],

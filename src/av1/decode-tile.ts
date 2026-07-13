@@ -156,6 +156,8 @@ class BlockContext {
   ref0: Int8Array
   ref1: Int8Array
   compType: Uint8Array
+  filterH: Uint8Array
+  filterV: Uint8Array
 
   constructor(n4: number) {
     this.mode = new Uint8Array(n4)
@@ -177,6 +179,8 @@ class BlockContext {
     this.ref0 = new Int8Array(n4)
     this.ref1 = new Int8Array(n4)
     this.compType = new Uint8Array(n4)
+    this.filterH = new Uint8Array(n4)
+    this.filterV = new Uint8Array(n4)
   }
 
   reset(keyframe: boolean): void {
@@ -200,6 +204,8 @@ class BlockContext {
     this.ref0.fill(-1)
     this.ref1.fill(-1)
     this.compType.fill(0)
+    this.filterH.fill(3)
+    this.filterV.fill(3)
   }
 }
 
@@ -570,6 +576,10 @@ export class TileDecoder {
       filterV: hdr.interpolationFilter,
       tx: TxfmSize.TX_4X4,
       uvtx: TxfmSize.TX_4X4,
+    }
+    for (let y = 0; y < Math.min(bh4, this.bh4 - this.by); y++) {
+      const off = (this.by + y) * this.bw4 + this.bx
+      this.interBs.fill(bs, off, off + Math.min(bw4, this.bw4 - this.bx))
     }
 
     // segment_id (pre-skip). The seg map is frame-absolute, so use this.by.
@@ -961,10 +971,12 @@ export class TileDecoder {
       haveLeft,
     )
     let candidateIndex = 0
+    let useSubpelFilter = true
     const newMvMode = this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('newmv_mode', modeContext & 7))
     if (newMvMode) {
       if (!this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('globalmv_mode', (modeContext >> 3) & 1))) {
         b.mvX = b.mvY = 0
+        useSubpelFilter = Math.min(bw4, bh4) === 1
       }
       else if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('refmv_mode', (modeContext >> 4) & 15))) {
         candidateIndex = 1
@@ -1013,8 +1025,23 @@ export class TileDecoder {
       this.readMvResidual(b, this.hdr.forceIntegerMv ? -1 : this.hdr.allowHighPrecisionMv ? 1 : 0)
     }
 
-    if (this.hdr.interpolationFilter === 4 && (b.mvX & 7 || b.mvY & 7))
-      throw new Error('ts-avif: switchable sub-pixel inter filters are not implemented')
+    if (this.hdr.interpolationFilter === 4) {
+      if (useSubpelFilter) {
+        const comp = b.ref1 >= 0 ? 1 : 0
+        const hctx = this.filterContext(bx4, by4, b.ref0, comp, 0)
+        b.filterH = this.msac.decodeSymbol(this.cdf.data, this.cdf.offset('filter', 0, hctx), 2)
+        if (this.seq.enableDualFilter) {
+          const vctx = this.filterContext(bx4, by4, b.ref0, comp, 1)
+          b.filterV = this.msac.decodeSymbol(this.cdf.data, this.cdf.offset('filter', 1, vctx), 2)
+        }
+        else {
+          b.filterV = b.filterH
+        }
+      }
+      else {
+        b.filterH = b.filterV = 0
+      }
+    }
 
     b.yMode = IntraPredMode.DC_PRED
     b.uvMode = IntraPredMode.DC_PRED
@@ -1090,6 +1117,20 @@ export class TileDecoder {
     return (haveTop ? this.a.ref0[bx4] : this.l.ref0[by4]) >= 4 ? 1 : 0
   }
 
+  private filterContext(bx4: number, by4: number, ref: number, compound: number, dir: 0 | 1): number {
+    const neighbor = (ctx: BlockContext, off: number): number => {
+      if (ctx.ref0[off] !== ref && ctx.ref1[off] !== ref) return 3
+      return dir ? ctx.filterV[off] : ctx.filterH[off]
+    }
+    const above = neighbor(this.a, bx4)
+    const left = neighbor(this.l, by4)
+    let filter = 3
+    if (above === left) filter = above
+    else if (above === 3) filter = left
+    else if (left === 3) filter = above
+    return compound * 4 + filter
+  }
+
   private buildMvCandidates(
     ref: number,
     _bs: BlockSize,
@@ -1101,61 +1142,86 @@ export class TileDecoder {
     haveLeft: boolean,
   ): { stack: Array<{ x: number, y: number, weight: number }>, count: number, context: number } {
     const stack: Array<{ x: number, y: number, weight: number }> = []
+    const w4 = Math.min(bw4, 16, this.colEnd - bx4)
+    const h4 = Math.min(bh4, 16, this.rowEnd - by4)
+    let haveNewMv = 0
     let rowMatch = 0
     let colMatch = 0
-    let haveNewMv = 0
-    const add = (x: number, y: number, weight: number, isNew: number): void => {
-      const existing = stack.find(candidate => candidate.x === x && candidate.y === y)
-      if (existing) existing.weight += weight
-      else stack.push({ x, y, weight })
-      haveNewMv |= isNew
-    }
-    if (haveTop) {
-      const off = (by4 - 1) * this.bw4 + bx4
-      if (this.interRef[off] === ref) {
-        rowMatch = 1
-        add(this.interMvX[off], this.interMvY[off], Math.min(bw4, 16) * 4 + 640, this.interNewMv[off])
-      }
-    }
-    if (haveLeft) {
-      const off = by4 * this.bw4 + bx4 - 1
-      if (this.interRef[off] === ref) {
-        colMatch = 1
-        add(this.interMvX[off], this.interMvY[off], Math.min(bh4, 16) * 4 + 640, this.interNewMv[off])
-      }
-    }
-    // A decoded top-right block participates in the nearest row scan. The
-    // frame map naturally excludes unavailable top-right regions because
-    // their reference entry is still -1 at this point in partition order.
-    if (haveTop && Math.max(bw4, bh4) <= 16 && bx4 + bw4 < this.bw4) {
-      const off = (by4 - 1) * this.bw4 + bx4 + bw4
-      if (this.interRef[off] === ref) {
-        rowMatch = 1
-        add(this.interMvX[off], this.interMvY[off], 4 + 640, this.interNewMv[off])
-      }
-    }
-    const nearestMatch = rowMatch + colMatch
-    let anyRowMatch = rowMatch
-    let anyColMatch = colMatch
-    const addSecondary = (x: number, y: number, weight: number, row: boolean): void => {
-      if (x < 0 || y < 0 || x >= this.bw4 || y >= this.bh4) return
+    const addCell = (x: number, y: number, weight: number, nearest: boolean, row: boolean): void => {
+      if (x < this.colStart || x >= this.colEnd || y < this.rowStart || y >= this.rowEnd) return
       const off = y * this.bw4 + x
       if (this.interRef[off] !== ref) return
-      if (row) anyRowMatch = 1
-      else anyColMatch = 1
-      // Secondary candidates do not contribute to the NEWMV nearest-match
-      // flag, but they remain ordered after the 640-weight nearest group.
-      add(this.interMvX[off], this.interMvY[off], weight, 0)
+      if (row) rowMatch = 1
+      else colMatch = 1
+      if (nearest) haveNewMv |= this.interNewMv[off]
+      const mvX = this.interMvX[off]
+      const mvY = this.interMvY[off]
+      const existing = stack.find(candidate => candidate.x === mvX && candidate.y === mvY)
+      if (existing) existing.weight += weight
+      else stack.push({ x: mvX, y: mvY, weight })
     }
-    if (haveTop && haveLeft)
-      addSecondary(bx4 - 1, by4 - 1, 4, true)
-    for (const distance of [3, 5]) {
-      if (by4 >= distance)
-        addSecondary(bx4 | 1, by4 - distance, Math.max(2, Math.min(bw4, 16) * 2), true)
-      if (bx4 >= distance)
-        addSecondary(bx4 - distance, by4 | 1, Math.max(2, Math.min(bh4, 16) * 2), false)
+
+    const scanRow = (y: number, x: number, maxRows: number, step: number, nearest: boolean): number => {
+      const firstBs = this.interBs[y * this.bw4 + x]
+      const candBw4 = BLOCK_DIMENSIONS[firstBs * 4]
+      const candBh4 = BLOCK_DIMENSIONS[firstBs * 4 + 1]
+      let len = Math.max(step, Math.min(bw4, candBw4))
+      if (bw4 <= candBw4) {
+        const weight = bw4 === 1 ? 2 : Math.max(2, Math.min(2 * maxRows, candBh4))
+        addCell(x, y, len * weight, nearest, true)
+        return weight >> 1
+      }
+      for (let dx = 0;;) {
+        addCell(x + dx, y, len * 2, nearest, true)
+        dx += len
+        if (dx >= w4) return 1
+        const bs = this.interBs[y * this.bw4 + x + dx]
+        len = Math.max(step, BLOCK_DIMENSIONS[bs * 4])
+      }
     }
-    const refMatchCount = anyRowMatch + anyColMatch
+
+    const scanCol = (x: number, y: number, maxCols: number, step: number, nearest: boolean): number => {
+      const firstBs = this.interBs[y * this.bw4 + x]
+      const candBw4 = BLOCK_DIMENSIONS[firstBs * 4]
+      const candBh4 = BLOCK_DIMENSIONS[firstBs * 4 + 1]
+      let len = Math.max(step, Math.min(bh4, candBh4))
+      if (bh4 <= candBh4) {
+        const weight = bh4 === 1 ? 2 : Math.max(2, Math.min(2 * maxCols, candBw4))
+        addCell(x, y, len * weight, nearest, false)
+        return weight >> 1
+      }
+      for (let dy = 0;;) {
+        addCell(x, y + dy, len * 2, nearest, false)
+        dy += len
+        if (dy >= h4) return 1
+        const bs = this.interBs[(y + dy) * this.bw4 + x]
+        len = Math.max(step, BLOCK_DIMENSIONS[bs * 4 + 1])
+      }
+    }
+
+    const maxRows = haveTop ? Math.min(((by4 - this.rowStart + 1) >> 1), 2 + (bh4 > 1 ? 1 : 0)) : 0
+    const maxCols = haveLeft ? Math.min(((bx4 - this.colStart + 1) >> 1), 2 + (bw4 > 1 ? 1 : 0)) : 0
+    let nRows = haveTop ? scanRow(by4 - 1, bx4, maxRows, bw4 >= 16 ? 4 : 1, true) : -1
+    let nCols = haveLeft ? scanCol(bx4 - 1, by4, maxCols, bh4 >= 16 ? 4 : 1, true) : -1
+    if (haveTop && Math.max(bw4, bh4) <= 16 && bx4 + bw4 < this.bw4) {
+      addCell(bx4 + bw4, by4 - 1, 4, true, true)
+    }
+    const nearestMatch = rowMatch + colMatch
+    const nearestCount = stack.length
+    for (let i = 0; i < nearestCount; i++) stack[i].weight += 640
+
+    if (haveTop && haveLeft) addCell(bx4 - 1, by4 - 1, 4, false, true)
+    for (let n = 2; n <= 3; n++) {
+      if (n > nRows && n <= maxRows) {
+        const y = ((by4 - 2 * n + 1) | 1)
+        nRows += scanRow(y, bx4 | 1, 1 + maxRows - n, bw4 >= 16 ? 4 : 2, false)
+      }
+      if (n > nCols && n <= maxCols) {
+        const x = ((bx4 - 2 * n + 1) | 1)
+        nCols += scanCol(x, by4 | 1, 1 + maxCols - n, bh4 >= 16 ? 4 : 2, false)
+      }
+    }
+    const refMatchCount = rowMatch + colMatch
     let refMvContext: number
     let newMvContext: number
     if (nearestMatch === 0) {
@@ -1170,7 +1236,9 @@ export class TileDecoder {
       refMvContext = 5
       newMvContext = 5 - haveNewMv
     }
-    stack.sort((a, c) => c.weight - a.weight)
+    const nearest = stack.slice(0, nearestCount).sort((a, c) => c.weight - a.weight)
+    const secondary = stack.slice(nearestCount).sort((a, c) => c.weight - a.weight)
+    stack.splice(0, stack.length, ...nearest, ...secondary)
     const count = stack.length
     while (stack.length < 2) stack.push({ x: 0, y: 0, weight: 2 })
     const globalMvContext = this.hdr.useRefFrameMvs ? 1 : 0
@@ -1223,6 +1291,8 @@ export class TileDecoder {
       this.a.ref0[o] = b.ref0
       this.a.ref1[o] = b.ref1
       this.a.compType[o] = b.ref1 >= 0 ? 1 : 0
+      this.a.filterH[o] = b.filterH
+      this.a.filterV[o] = b.filterV
     }
     for (let i = 0; i < bh4; i++) {
       const o = by4 + i
@@ -1238,6 +1308,8 @@ export class TileDecoder {
       this.l.ref0[o] = b.ref0
       this.l.ref1[o] = b.ref1
       this.l.compType[o] = b.ref1 >= 0 ? 1 : 0
+      this.l.filterH[o] = b.filterH
+      this.l.filterV[o] = b.filterV
     }
     if (hasChroma) {
       this.a.uvmode.fill(IntraPredMode.DC_PRED, bx4 >> this.ssHor, (bx4 >> this.ssHor) + cbw4)
