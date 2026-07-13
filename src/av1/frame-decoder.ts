@@ -13,6 +13,7 @@ import { INTRA_EDGE_TREE } from './intra-edge'
 import { applyLoopFilter, computeLoopFilterLevels, LoopFilterData } from './loopfilter'
 import { FrameBuffers, PixelReconstructor } from './recon'
 import { applyRestoration, RestorationInfo } from './restoration'
+import { upscaleFrame } from './superres'
 
 export interface DecodedFrame {
   buf: FrameBuffers
@@ -21,7 +22,7 @@ export interface DecodedFrame {
 }
 
 export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]): DecodedFrame {
-  const buf = new FrameBuffers(
+  let buf = new FrameBuffers(
     hdr.miCols,
     hdr.miRows,
     seq.subsamplingX,
@@ -61,7 +62,7 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
   // Loop restoration reads stripe boundaries from the deblocked (pre-CDEF)
   // planes, so snapshot them before CDEF runs.
   const lrActive = restorationInfo !== null && restorationInfo.restorePlanes !== 0
-  const deblocked = lrActive
+  let deblocked: { y: PixelPlane, u: PixelPlane, v: PixelPlane } | null = lrActive
     ? { y: buf.y.slice(), u: buf.u.slice(), v: buf.v.slice() }
     : null
 
@@ -82,10 +83,33 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     })
   }
 
+  if (hdr.frameWidth !== hdr.upscaledWidth) {
+    buf = upscaleFrame(buf, seq, hdr)
+    if (deblocked) {
+      const preCdef = new FrameBuffers(
+        hdr.miCols,
+        hdr.miRows,
+        seq.subsamplingX,
+        seq.subsamplingY,
+        seq.monochrome,
+        seq.bitDepth,
+      )
+      preCdef.y.set(deblocked.y)
+      preCdef.u.set(deblocked.u)
+      preCdef.v.set(deblocked.v)
+      const upscaledDeblocked = upscaleFrame(preCdef, seq, hdr)
+      deblocked = {
+        y: upscaledDeblocked.y,
+        u: upscaledDeblocked.u,
+        v: upscaledDeblocked.v,
+      }
+    }
+  }
+
   if (lrActive && deblocked)
     applyRestoration(buf, restorationInfo!, seq, hdr, deblocked)
 
-  return { buf, width: hdr.frameWidth, height: hdr.frameHeight }
+  return { buf, width: hdr.upscaledWidth, height: hdr.frameHeight }
 }
 
 /**

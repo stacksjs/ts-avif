@@ -37,14 +37,27 @@ export class FrameBuffers {
     ssVer: number,
     monochrome: boolean,
     bitDepth = 8,
+    pixelWidth = miCols * 4,
+    pixelHeight = miRows * 4,
   ) {
-    this.yStride = miCols * 4
-    this.uvStride = (miCols * 4) >> ssHor
-    const yH = miRows * 4
-    const uvH = (miRows * 4) >> ssVer
+    this.yStride = pixelWidth
+    this.uvStride = (pixelWidth + ssHor) >> ssHor
+    const yH = pixelHeight
+    const uvH = (pixelHeight + ssVer) >> ssVer
     this.y = createPixelPlane(this.yStride * yH, bitDepth)
     this.u = createPixelPlane(monochrome ? 0 : this.uvStride * uvH, bitDepth)
     this.v = createPixelPlane(monochrome ? 0 : this.uvStride * uvH, bitDepth)
+  }
+
+  static forDimensions(
+    width: number,
+    height: number,
+    ssHor: number,
+    ssVer: number,
+    monochrome: boolean,
+    bitDepth: number,
+  ): FrameBuffers {
+    return new FrameBuffers(0, 0, ssHor, ssVer, monochrome, bitDepth, width, height)
   }
 
   plane(i: number): PixelPlane {

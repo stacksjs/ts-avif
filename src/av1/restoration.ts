@@ -50,7 +50,7 @@ export class RestorationInfo {
 
   constructor(readonly seq: SequenceHeader, readonly hdr: FrameHeader) {
     const lr = hdr.lr
-    const w = hdr.frameWidth
+    const w = hdr.upscaledWidth
     const h = hdr.frameHeight
     for (let p = 0; p < seq.numPlanes; p++) {
       if (lr.frameRestorationType[p] !== 0) // RestorationType.NONE
@@ -100,17 +100,32 @@ export class RestorationInfo {
       const halfUnit = unitSize >> 1
       if (y && y + halfUnit > h)
         continue
-      const x = (bx * 4) >> ssHor
-      if (x & mask)
-        continue
-      const w = (this.hdr.frameWidth + ssHor) >> ssHor
-      if (x && x + halfUnit > w)
-        continue
-
-      const unitCol = x >> unitLog2
       const unitRow = y >> unitLog2
-      const unit = this.units[p][unitRow * this.unitCols[p] + unitCol]
-      this.readUnit(msac, cdf, p, lr.frameRestorationType[p], unit)
+      const w = (this.hdr.upscaledWidth + ssHor) >> ssHor
+
+      if (this.hdr.frameWidth !== this.hdr.upscaledWidth) {
+        const sbStep = this.seq.use128x128Superblock ? 32 : 16
+        const denom = this.hdr.superresDenom
+        const round = unitSize * 8 - 1
+        const shift = unitLog2 + 3
+        const x0 = ((4 * bx * denom >> ssHor) + round) >> shift
+        const x1 = ((4 * (bx + sbStep) * denom >> ssHor) + round) >> shift
+        const nUnits = Math.max(1, (w + halfUnit) >> unitLog2)
+        for (let unitCol = x0; unitCol < Math.min(x1, nUnits); unitCol++) {
+          const unit = this.units[p][unitRow * this.unitCols[p] + unitCol]
+          this.readUnit(msac, cdf, p, lr.frameRestorationType[p], unit)
+        }
+      }
+      else {
+        const x = (bx * 4) >> ssHor
+        if (x & mask)
+          continue
+        if (x && x + halfUnit > w)
+          continue
+        const unitCol = x >> unitLog2
+        const unit = this.units[p][unitRow * this.unitCols[p] + unitCol]
+        this.readUnit(msac, cdf, p, lr.frameRestorationType[p], unit)
+      }
     }
   }
 
@@ -808,7 +823,7 @@ export function applyRestoration(
   deblocked: { y: PixelPlane, u: PixelPlane, v: PixelPlane },
 ): void {
   const sb128 = seq.use128x128Superblock ? 1 : 0
-  const W = hdr.frameWidth
+  const W = hdr.upscaledWidth
   const H = hdr.frameHeight
   const sbSize = 64 << sb128
   const sbh = (H + sbSize - 1) >> (6 + sb128)

@@ -253,8 +253,19 @@ export class TileDecoder {
         this.cdefIdx[0] = this.cdefIdx[1] = this.cdefIdx[2] = this.cdefIdx[3] = -1
         this.restoration?.readForSuperblock(this.msac, this.cdf, this.bx, this.by)
         this.decodeSb(rootBl, sbRoot)
-        if (this.cdefData && this.cdefIdx[0] >= 0)
-          this.cdefData.idx[(this.by >> 4) * this.cdefData.sb64w + (this.bx >> 4)] = this.cdefIdx[0]
+        if (this.cdefData) {
+          const quadrants = this.seq.use128x128Superblock ? 4 : 1
+          const baseX = this.bx >> 4
+          const baseY = this.by >> 4
+          for (let i = 0; i < quadrants; i++) {
+            if (this.cdefIdx[i] < 0)
+              continue
+            const x = baseX + (i & 1)
+            const y = baseY + (i >> 1)
+            if (x < this.cdefData.sb64w && y < ((this.bh4 + 15) >> 4))
+              this.cdefData.idx[y * this.cdefData.sb64w + x] = this.cdefIdx[i]
+          }
+        }
       }
     }
   }
