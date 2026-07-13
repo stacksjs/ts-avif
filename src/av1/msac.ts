@@ -275,6 +275,16 @@ export class SymbolDecoder {
     return v
   }
 
+  /** Decode a uniformly distributed integer in [0, n). */
+  decodeUniform(n: number): number {
+    if (n <= 1)
+      return 0
+    const l = floorLog2(n) + 1
+    const m = (1 << l) - n
+    const v = this.readLiteral(l - 1)
+    return v < m ? v : (v << 1) - m + this.decodeBoolEqui()
+  }
+
   /** Exp-Golomb style code used for coefficient levels (spec read_golomb). */
   readGolomb(): number {
     let numLeadingZeros = 0

@@ -92,6 +92,9 @@ export interface Av1Block {
   uvAngle: number
   cflAlpha: [number, number]
   palSz: [number, number]
+  palettes: [Uint16Array, Uint16Array, Uint16Array]
+  palIdxY: Uint8Array | null
+  palIdxUv: Uint8Array | null
   tx: number
   uvtx: number
 }
@@ -114,6 +117,8 @@ class BlockContext {
   partition: Uint8Array
   uvmode: Uint8Array
   palSz: Uint8Array
+  palSzUv: Uint8Array
+  palettes: [Uint16Array, Uint16Array, Uint16Array]
 
   constructor(n4: number) {
     this.mode = new Uint8Array(n4)
@@ -128,6 +133,8 @@ class BlockContext {
     this.partition = new Uint8Array(n4 >> 1)
     this.uvmode = new Uint8Array(n4)
     this.palSz = new Uint8Array(n4)
+    this.palSzUv = new Uint8Array(n4)
+    this.palettes = [new Uint16Array(n4 * 8), new Uint16Array(n4 * 8), new Uint16Array(n4 * 8)]
   }
 
   reset(keyframe: boolean): void {
@@ -145,6 +152,7 @@ class BlockContext {
     this.ccoef[1].fill(0x40)
     this.segPred.fill(0)
     this.palSz.fill(0)
+    this.palSzUv.fill(0)
   }
 }
 
@@ -472,6 +480,9 @@ export class TileDecoder {
       uvAngle: 0,
       cflAlpha: [0, 0],
       palSz: [0, 0],
+      palettes: [new Uint16Array(8), new Uint16Array(8), new Uint16Array(8)],
+      palIdxY: null,
+      palIdxUv: null,
       tx: TxfmSize.TX_4X4,
       uvtx: TxfmSize.TX_4X4,
     }
@@ -639,12 +650,14 @@ export class TileDecoder {
       if (b.yMode === IntraPredMode.DC_PRED) {
         const palCtx = (this.a.palSz[bx4] > 0 ? 1 : 0) + (this.l.palSz[by4] > 0 ? 1 : 0)
         if (msac.decodeBoolAdapt(cdf.data, cdf.offset('pal_y', szCtx, palCtx)))
-          throw new Error('ts-avif: palette mode is not supported yet')
+          this.readPalettePlane(b, 0, szCtx, bx4, by4)
       }
       if (hasChroma && b.uvMode === IntraPredMode.DC_PRED) {
         const palCtx = b.palSz[0] > 0 ? 1 : 0
-        if (msac.decodeBoolAdapt(cdf.data, cdf.offset('pal_uv', palCtx)))
-          throw new Error('ts-avif: palette mode is not supported yet')
+        if (msac.decodeBoolAdapt(cdf.data, cdf.offset('pal_uv', palCtx))) {
+          this.readPalettePlane(b, 1, szCtx, bx4, by4)
+          this.readPaletteV(b)
+        }
       }
     }
 
@@ -657,6 +670,11 @@ export class TileDecoder {
         b.yAngle = msac.decodeSymbol(cdf.data, cdf.offset('filter_intra'), 4)
       }
     }
+
+    if (b.palSz[0])
+      b.palIdxY = this.readPaletteIndices(b.palSz[0], 0, w4, h4, bw4, bh4)
+    if (b.palSz[1])
+      b.palIdxUv = this.readPaletteIndices(b.palSz[1], 1, (w4 + this.ssHor) >> this.ssHor, (h4 + this.ssVer) >> this.ssVer, cbw4, cbh4)
 
     // tx size
     let tDim: TxfmInfo
@@ -695,6 +713,9 @@ export class TileDecoder {
       this.a.tx[o] = tDim.lw
       this.a.mode[o] = yModeNofilt
       this.a.palSz[o] = b.palSz[0]
+      this.a.palSzUv[o] = b.palSz[1]
+      for (let pl = 0; pl < 3; pl++)
+        this.a.palettes[pl].set(b.palettes[pl], o * 8)
       this.a.segPred[o] = 0
       this.a.skipMode[o] = 0
       this.a.intra[o] = 1
@@ -706,6 +727,9 @@ export class TileDecoder {
       this.l.tx[o] = tDim.lh
       this.l.mode[o] = yModeNofilt
       this.l.palSz[o] = b.palSz[0]
+      this.l.palSzUv[o] = b.palSz[1]
+      for (let pl = 0; pl < 3; pl++)
+        this.l.palettes[pl].set(b.palettes[pl], o * 8)
       this.l.segPred[o] = 0
       this.l.skipMode[o] = 0
       this.l.intra[o] = 1
@@ -715,6 +739,107 @@ export class TileDecoder {
       this.a.uvmode.fill(b.uvMode, cbx4, cbx4 + cbw4)
       this.l.uvmode.fill(b.uvMode, cby4, cby4 + cbh4)
     }
+  }
+
+  private readPalettePlane(b: Av1Block, pl: number, szCtx: number, bx4: number, by4: number): void {
+    const palSz = this.msac.decodeSymbol(this.cdf.data, this.cdf.offset('pal_sz', pl ? 1 : 0, szCtx), 6) + 2
+    b.palSz[pl ? 1 : 0] = palSz
+    const leftSize = pl ? this.l.palSzUv[by4] : this.l.palSz[by4]
+    const aboveSize = (by4 & 15) ? (pl ? this.a.palSzUv[bx4] : this.a.palSz[bx4]) : 0
+    const left = this.l.palettes[pl]
+    const above = this.a.palettes[pl]
+    const cache: number[] = []
+    for (let i = 0; i < leftSize; i++) cache.push(left[by4 * 8 + i])
+    for (let i = 0; i < aboveSize; i++) cache.push(above[bx4 * 8 + i])
+    cache.sort((a, c) => a - c)
+    const unique = cache.filter((v, i) => i === 0 || v !== cache[i - 1])
+    const reused: number[] = []
+    for (const value of unique) {
+      if (reused.length < palSz && this.msac.decodeBoolEqui())
+        reused.push(value)
+    }
+
+    const fresh: number[] = []
+    const max = (1 << this.seq.bitDepth) - 1
+    if (reused.length < palSz) {
+      let previous = this.msac.readLiteral(this.seq.bitDepth)
+      fresh.push(previous)
+      if (reused.length + fresh.length < palSz) {
+        let bits = this.seq.bitDepth - 3 + this.msac.readLiteral(2)
+        while (reused.length + fresh.length < palSz) {
+          previous = Math.min(previous + this.msac.readLiteral(bits) + (pl ? 0 : 1), max)
+          fresh.push(previous)
+          if (previous + (pl ? 0 : 1) >= max) {
+            while (reused.length + fresh.length < palSz) fresh.push(max)
+            break
+          }
+          bits = Math.min(bits, 1 + floorLog2(max - previous - (pl ? 0 : 1)))
+        }
+      }
+    }
+    const palette = b.palettes[pl]
+    const merged = [...reused, ...fresh].sort((a, c) => a - c)
+    for (let i = 0; i < palSz; i++) palette[i] = merged[i]
+  }
+
+  private readPaletteV(b: Av1Block): void {
+    const palette = b.palettes[2]
+    const size = b.palSz[1]
+    const max = (1 << this.seq.bitDepth) - 1
+    if (this.msac.decodeBoolEqui()) {
+      const bits = this.seq.bitDepth - 4 + this.msac.readLiteral(2)
+      let previous = palette[0] = this.msac.readLiteral(this.seq.bitDepth)
+      for (let i = 1; i < size; i++) {
+        let delta = this.msac.readLiteral(bits)
+        if (delta && this.msac.decodeBoolEqui()) delta = -delta
+        previous = palette[i] = (previous + delta) & max
+      }
+    }
+    else {
+      for (let i = 0; i < size; i++) palette[i] = this.msac.readLiteral(this.seq.bitDepth)
+    }
+  }
+
+  private readPaletteIndices(palSz: number, pl: number, w4: number, h4: number, bw4: number, bh4: number): Uint8Array {
+    const width = bw4 * 4
+    const height = bh4 * 4
+    const visibleWidth = w4 * 4
+    const visibleHeight = h4 * 4
+    const indices = new Uint8Array(width * height)
+    indices[0] = this.msac.decodeUniform(palSz)
+    const cdfBase = this.cdf.offset('color_map', pl, palSz - 2)
+    for (let diagonal = 1; diagonal < visibleWidth + visibleHeight - 1; diagonal++) {
+      const first = Math.min(diagonal, visibleWidth - 1)
+      const last = Math.max(0, diagonal - visibleHeight + 1)
+      for (let x = first; x >= last; x--) {
+        const y = diagonal - x
+        const haveLeft = x > 0
+        const haveTop = y > 0
+        const order: number[] = []
+        let ctx = 0
+        if (!haveLeft) order.push(indices[(y - 1) * width + x])
+        else if (!haveTop) order.push(indices[y * width + x - 1])
+        else {
+          const left = indices[y * width + x - 1]
+          const top = indices[(y - 1) * width + x]
+          const topLeft = indices[(y - 1) * width + x - 1]
+          if (top === left && top === topLeft) { ctx = 4; order.push(top) }
+          else if (top === left) { ctx = 3; order.push(top, topLeft) }
+          else if (top === topLeft || left === topLeft) { ctx = 2; order.push(topLeft, top === topLeft ? left : top) }
+          else { ctx = 1; order.push(Math.min(top, left), Math.max(top, left), topLeft) }
+        }
+        for (let color = 0; color < palSz; color++) {
+          if (!order.includes(color)) order.push(color)
+        }
+        const symbol = this.msac.decodeSymbol(this.cdf.data, cdfBase + ctx * 8, palSz - 1)
+        indices[y * width + x] = order[symbol]
+      }
+    }
+    for (let y = 0; y < visibleHeight; y++)
+      indices.fill(indices[y * width + visibleWidth - 1], y * width + visibleWidth, (y + 1) * width)
+    for (let y = visibleHeight; y < height; y++)
+      indices.set(indices.subarray((visibleHeight - 1) * width, visibleHeight * width), y * width)
+    return indices
   }
 
   private readSegId(

@@ -120,6 +120,30 @@ export class PixelReconstructor {
 
     if (this.lf && this.lfLevels)
       this.recordLoopFilter(bs, b, dec)
+
+    const bw4 = BLOCK_DIMENSIONS[bs * 4]
+    const bh4 = BLOCK_DIMENSIONS[bs * 4 + 1]
+    if (b.palSz[0] && b.palIdxY) {
+      const width = bw4 * 4
+      const height = bh4 * 4
+      const off = dec.by * 4 * this.buf.yStride + dec.bx * 4
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++)
+          this.buf.y[off + y * this.buf.yStride + x] = b.palettes[0][b.palIdxY[y * width + x]]
+      }
+    }
+    if (b.palSz[1] && b.palIdxUv) {
+      const width = ((bw4 + dec.ssHor) >> dec.ssHor) * 4
+      const height = ((bh4 + dec.ssVer) >> dec.ssVer) * 4
+      const off = (dec.by >> dec.ssVer) * 4 * this.buf.uvStride + (dec.bx >> dec.ssHor) * 4
+      for (let pl = 1; pl <= 2; pl++) {
+        const plane = this.buf.plane(pl)
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++)
+            plane[off + y * this.buf.uvStride + x] = b.palettes[pl][b.palIdxUv[y * width + x]]
+        }
+      }
+    }
   }
 
   private recordLoopFilter(bs: number, b: Av1Block, dec: TileDecoder): void {
@@ -281,7 +305,8 @@ export class PixelReconstructor {
     const stride = buf.stride(plane)
     const dstOff = 4 * bx + 4 * by * stride
 
-    if (plane === 0) {
+    const usesPalette = b.palSz[plane === 0 ? 0 : 1] !== 0
+    if (!usesPalette && plane === 0) {
       let angle = b.yAngle
       const prep = prepareIntraEdges(
         bx,
@@ -319,7 +344,7 @@ export class PixelReconstructor {
         this.seq.bitDepth,
       )
     }
-    else {
+    else if (!usesPalette) {
       const skipPred = b.uvMode === IntraPredMode.CFL_PRED && b.cflAlpha[plane - 1] !== 0
       if (!skipPred) {
         const ssHor = dec.ssHor
