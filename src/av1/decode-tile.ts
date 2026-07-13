@@ -205,6 +205,9 @@ export class TileDecoder {
   /** Loop-restoration reader (consumes per-SB entropy bits when active). */
   restoration: { readForSuperblock: (m: SymbolDecoder, c: CdfContext, bx: number, by: number) => void } | null = null
 
+  /** CDEF metadata sink: cdef index per 64x64 sb, non-skip per 4x4. */
+  cdefData: { idx: Int8Array, noskip: Uint8Array, sb64w: number } | null = null
+
   recon: Reconstructor | null
 
   constructor(
@@ -251,6 +254,8 @@ export class TileDecoder {
         this.cdefIdx[0] = this.cdefIdx[1] = this.cdefIdx[2] = this.cdefIdx[3] = -1
         this.restoration?.readForSuperblock(this.msac, this.cdf, this.bx, this.by)
         this.decodeSb(rootBl, sbRoot)
+        if (this.cdefData && this.cdefIdx[0] >= 0)
+          this.cdefData.idx[(this.by >> 4) * this.cdefData.sb64w + (this.bx >> 4)] = this.cdefIdx[0]
       }
     }
   }
@@ -479,6 +484,15 @@ export class TileDecoder {
       b.segId = this.readSegId(this.bx, this.by, w4, h4, haveTop, haveLeft, b.skip === 1)
     if (seg.enabled)
       this.writeSegMap(this.bx, this.by, bw4, bh4, b.segId)
+
+    // CDEF non-skip map (blocks with coded coefficients get filtered)
+    if (this.cdefData && !b.skip) {
+      const cd = this.cdefData
+      const hh = Math.min(bh4, this.bh4 - this.by)
+      const ww = Math.min(bw4, this.bw4 - this.bx)
+      for (let y = 0; y < hh; y++)
+        cd.noskip.fill(1, (this.by + y) * this.bw4 + this.bx, (this.by + y) * this.bw4 + this.bx + ww)
+    }
 
     // cdef index
     if (!b.skip) {

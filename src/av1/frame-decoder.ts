@@ -5,6 +5,7 @@
 import type { FrameHeader } from './frame-header'
 import type { SequenceHeader } from './sequence'
 import type { Tile } from './tile-group'
+import { applyCdef, CdefData } from './cdef'
 import { CdfContext } from './cdf'
 import { TileDecoder } from './decode-tile'
 import { INTRA_EDGE_TREE } from './intra-edge'
@@ -31,6 +32,8 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     recon.lf = new LoopFilterData(hdr.miCols, hdr.miRows, seq.subsamplingX, seq.subsamplingY)
     recon.lfLevels = computeLoopFilterLevels(hdr)
   }
+  const cdefActive = seq.enableCdef
+  const cdefData = cdefActive ? new CdefData(hdr.miCols, hdr.miRows) : null
   const sbRoot = INTRA_EDGE_TREE[seq.use128x128Superblock ? 0 : 1]
 
   const { tileCols, tileRows, miColStarts, miRowStarts } = hdr.tileInfo
@@ -43,11 +46,28 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     dec.colEnd = Math.min(miColStarts[tile.tileCol + 1], hdr.miCols)
     dec.rowStart = miRowStarts[tile.tileRow]
     dec.rowEnd = Math.min(miRowStarts[tile.tileRow + 1], hdr.miRows)
+    dec.cdefData = cdefData
     dec.decodeTile(sbRoot)
   }
 
   if (recon.lf)
     applyLoopFilter(buf, recon.lf, seq, hdr)
+
+  if (cdefData) {
+    applyCdef(buf, cdefData, {
+      enableCdef: true,
+      damping: hdr.cdef.damping,
+      bits: hdr.cdef.bits,
+      yPri: hdr.cdef.yPriStrength,
+      ySec: hdr.cdef.ySecStrength,
+      uvPri: hdr.cdef.uvPriStrength,
+      uvSec: hdr.cdef.uvSecStrength,
+      monochrome: seq.monochrome,
+      ssHor: seq.subsamplingX,
+      ssVer: seq.subsamplingY,
+      layout: seq.monochrome ? 0 : seq.subsamplingX === 0 ? 3 : seq.subsamplingY === 0 ? 2 : 1,
+    })
+  }
 
   return { buf, width: hdr.frameWidth, height: hdr.frameHeight }
 }
