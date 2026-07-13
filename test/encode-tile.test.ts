@@ -30,6 +30,16 @@ function encodeRaw(rgba: Uint8Array, width: number, height: number, q = 80): Uin
   return out
 }
 
+function meanAbsoluteRgbError(expected: Uint8Array, actual: Uint8Array): number {
+  let error = 0
+  for (let i = 0; i < expected.length; i += 4) {
+    error += Math.abs(expected[i] - actual[i])
+    error += Math.abs(expected[i + 1] - actual[i + 1])
+    error += Math.abs(expected[i + 2] - actual[i + 2])
+  }
+  return error / (expected.length / 4 * 3)
+}
+
 describe('pure TypeScript intra tile encoder', () => {
   it('produces a decodable AV1 stream for edge dimensions', () => {
     for (const [width, height] of [[1, 1], [7, 5], [17, 9], [64, 64], [65, 33]]) {
@@ -50,6 +60,23 @@ describe('pure TypeScript intra tile encoder', () => {
         expect(Math.abs(sum / 256 - rgb[channel])).toBeLessThanOrEqual(6)
       }
     }
+  })
+
+  it('preserves spatial detail with full 4x4 transform coefficients', () => {
+    const width = 16
+    const height = 16
+    const rgba = solid(width, height, 0, 0, 0)
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4
+        rgba[i] = (x * 11 + y * 3) & 0xFF
+        rgba[i + 1] = (y * 13 + x * 2) & 0xFF
+        rgba[i + 2] = ((x + y) * 7) & 0xFF
+      }
+    }
+
+    const decoded = decodeAV1(encodeRaw(rgba, width, height, 51))
+    expect(meanAbsoluteRgbError(rgba, decoded.data)).toBeLessThan(4)
   })
 
   it('rejects non-opaque pixels instead of discarding alpha', () => {

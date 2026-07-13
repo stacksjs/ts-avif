@@ -1,12 +1,26 @@
 import { CdfContext } from './cdf'
 import { BlockLevel, BlockPartition, IntraPredMode } from './consts'
+import { forward4x4 } from './fwd-txfm'
+import { itxfmAdd } from './itx'
 import { SymbolEncoder } from './msac'
 import {
   AL_PART_CTX,
   DQ_TBL_8BPC,
   INTRA_MODE_CONTEXT,
+  LO_CTX_OFFSETS,
   PARTITION_TYPE_COUNT,
+  SCANS,
 } from './tables'
+
+// 4x4 DCT_DCT is the only transform the intra encoder emits. These mirror the
+// decoder's per-tx constants (see decodeCoefs / itxfmAdd) for tx = TX_4X4.
+const TX_4X4 = 0
+const TXTP_DCT_DCT = 0
+const SCAN_4X4 = SCANS[TX_4X4]
+const LEVEL_STRIDE = 4 // 2D level-buffer stride for 4x4 (= 4 << slh, slh = 0)
+const RC_SHIFT = 2 // slh + 2
+const RC_MASK = 3 // (4 << slh) - 1
+const CF_MAX = 32767 // 8bpc coefficient clamp (dav1d cf_max)
 
 interface Yuv420 {
   y: Uint8Array
@@ -112,7 +126,15 @@ class IntraTileEncoder {
   private bx = 0
   private by = 0
   private recon: [Uint8Array, Uint8Array, Uint8Array]
-  private dq: number
+  private dqDc: number
+  private dqAc: number
+  // Per-block coefficient scratch (raster order), reused across blocks.
+  private residual = new Int32Array(16)
+  private coef = new Float64Array(16)
+  private absLevel = new Int32Array(16)
+  private signBit = new Uint8Array(16)
+  private cf = new Int32Array(16)
+  private levels = new Uint8Array(LEVEL_STRIDE * (4 + 2))
 
   constructor(private source: Yuv420, private baseQIdx: number) {
     this.cdf = new CdfContext(baseQIdx)
@@ -122,7 +144,9 @@ class IntraTileEncoder {
       new Uint8Array(source.u.length),
       new Uint8Array(source.v.length),
     ]
-    this.dq = DQ_TBL_8BPC[baseQIdx * 2]
+    // Frame-level quantizers (no segmentation / delta-q): matches computeDq().
+    this.dqDc = DQ_TBL_8BPC[baseQIdx * 2]
+    this.dqAc = DQ_TBL_8BPC[baseQIdx * 2 + 1]
   }
 
   encode(): Uint8Array {
@@ -230,6 +254,12 @@ class IntraTileEncoder {
     this.l.skip[by4] = 0
   }
 
+  /**
+   * Forward-transform, quantize and entropy-code one 4x4 DCT_DCT tx block, then
+   * reconstruct it via the real inverse transform so the encoder's neighbor
+   * predictions stay bit-identical to the decoder's. The entropy layer is the
+   * exact inverse of TileDecoder.decodeCoefs for the TWO_D 4x4 path.
+   */
   private encodeCoefficients(
     plane: number,
     aArr: Uint8Array,
@@ -251,78 +281,229 @@ class IntraTileEncoder {
     const px = plane === 0 ? this.bx * 4 : (this.bx >> 1) * 4
     const py = plane === 0 ? this.by * 4 : (this.by >> 1) * 4
     const pred = dcPredict(reconstructed, stride, px, py)
-    const wanted = blockAverage(target, stride, px, py)
-    const { token, residual } = chooseDcToken(wanted - pred, this.dq)
+
+    // residual = source - DC prediction (row-major), then forward transform.
+    const residual = this.residual
+    for (let r = 0; r < 4; r++) {
+      const row = (py + r) * stride + px
+      for (let c = 0; c < 4; c++)
+        residual[r * 4 + c] = target[row + c] - pred
+    }
+    forward4x4(residual, this.coef)
+
+    // Quantize each coefficient to an integer token; keep magnitude and sign.
+    const absLevel = this.absLevel
+    const signBit = this.signBit
+    let eob = -1
+    for (let rc = 0; rc < 16; rc++) {
+      const q = rc === 0 ? this.dqDc : this.dqAc
+      const t = Math.round(this.coef[rc] / q)
+      const a = t < 0 ? -t : t
+      absLevel[rc] = a
+      signBit[rc] = t < 0 ? 1 : 0
+    }
+    // eob = highest scan position with a non-zero level.
+    for (let i = 15; i >= 0; i--) {
+      if (absLevel[SCAN_4X4[i]] !== 0) {
+        eob = i
+        break
+      }
+    }
 
     const coefSkipOff = this.cdf.offset('coef_skip', 0, skipCtx)
-    if (token === 0) {
+    if (eob < 0) {
+      // Whole block quantizes to zero: signal coef_skip and keep the prediction.
       this.msac.encodeBoolAdapt(this.cdf.data, coefSkipOff, 1)
       aArr[aOff] = 0x40
       lArr[lOff] = 0x40
       fillBlock(reconstructed, stride, px, py, pred)
       return
     }
-
     this.msac.encodeBoolAdapt(this.cdf.data, coefSkipOff, 0)
+
     if (!chroma) {
-      // In the reduced intra transform set, index 1 is DCT_DCT.
+      // Reduced intra transform set: symbol index 1 maps to DCT_DCT.
       this.msac.encodeSymbol(this.cdf.data, this.cdf.offset('txtp_intra2', 0, IntraPredMode.DC_PRED), 4, 1)
     }
-    this.msac.encodeSymbol(this.cdf.data, this.cdf.offset('eob_bin_16', chroma, 0), 4, 0)
 
-    const eobBase = this.cdf.offset('eob_base_tok', 0, chroma)
-    this.msac.encodeSymbol(this.cdf.data, eobBase, 2, Math.min(token - 1, 2))
-    if (token >= 3)
-      this.encodeHighToken(this.cdf.offset('br_tok', 0, chroma), Math.min(token, 15))
+    this.encodeEob(chroma, eob)
+    this.encodeLevels(chroma, eob)
+    const culLevel = this.encodeSignsAndDequant(chroma, eob, aArr, aOff, lArr, lOff)
 
-    let signSum = -2 + (aArr[aOff] >> 6) + (lArr[lOff] >> 6)
-    signSum = (signSum !== 0 ? 1 : 0) + (signSum > 0 ? 1 : 0)
-    const negative = residual < 0 ? 1 : 0
-    this.msac.encodeBoolAdapt(this.cdf.data, this.cdf.offset('dc_sign', chroma, signSum), negative)
-    if (token >= 15)
-      this.msac.writeGolomb(token - 15)
+    // Reconstruct exactly as the decoder does: prediction + inverse transform.
+    fillBlock(reconstructed, stride, px, py, pred)
+    const dstOff = py * stride + px
+    itxfmAdd(reconstructed, dstOff, stride, this.cf, TX_4X4, TXTP_DCT_DCT, eob)
 
-    const ctx = Math.min(token, 63) | (negative ? 0 : 2 << 6)
+    const dcSignLevel = absLevel[0] === 0 ? (1 << 6) : (signBit[0] ? 0 : (2 << 6))
+    const ctx = Math.min(culLevel, 63) | dcSignLevel
     aArr[aOff] = ctx
     lArr[lOff] = ctx
-    fillBlock(reconstructed, stride, px, py, clipByte(pred + residual))
   }
 
-  private encodeHighToken(cdfOff: number, token: number): void {
-    const remaining = token
+  /** Emit the end-of-block position (inverse of the decoder's eob decode). */
+  private encodeEob(chroma: number, eob: number): void {
+    const eobPt = eob === 0 ? 0 : eob === 1 ? 1 : eob <= 3 ? 2 : eob <= 7 ? 3 : 4
+    // is1d = 0 (DCT_DCT is TWO_D); tDim.ctx = 0 for 4x4.
+    this.msac.encodeSymbol(this.cdf.data, this.cdf.offset('eob_bin_16', chroma, 0), 4, eobPt)
+    if (eobPt > 1) {
+      const eobBin = eobPt - 2
+      const hiBit = (eob >> eobBin) & 1
+      this.msac.encodeBoolAdapt(this.cdf.data, this.cdf.offset('eob_hi_bit', 0, chroma, eobBin), hiBit)
+      if (eobBin > 0)
+        this.msac.writeLiteral(eob & ((1 << eobBin) - 1), eobBin)
+    }
+  }
+
+  /**
+   * Emit the coefficient base/range tokens in the decoder's read order
+   * (eob position, then descending scan to 1, then DC), maintaining the level
+   * neighborhood buffer so contexts match TileDecoder.decodeCoefs exactly.
+   */
+  private encodeLevels(chroma: number, eob: number): void {
+    const { absLevel } = this
+    const eobBase = this.cdf.offset('eob_base_tok', 0, chroma)
+    const hiBase = this.cdf.offset('br_tok', 0, chroma)
+    const loBase = this.cdf.offset('base_tok', 0, chroma)
+    const levels = this.levels
+    levels.fill(0, 0, LEVEL_STRIDE * (4 + 2))
+
+    if (eob === 0) {
+      // dc-only block: eob_base_tok at context 0.
+      const lv = absLevel[0]
+      const tokBr = Math.min(lv, 3) - 1
+      this.msac.encodeSymbol(this.cdf.data, eobBase, 2, tokBr)
+      if (tokBr === 2)
+        this.encodeHiTok(hiBase, lv)
+      return
+    }
+
+    // eob-position coefficient.
+    const rcEob = SCAN_4X4[eob]
+    const xE = rcEob >> RC_SHIFT
+    const yE = rcEob & RC_MASK
+    const eobCtx = 1 + (eob > 2 ? 1 : 0) + (eob > 4 ? 1 : 0)
+    const lvEob = absLevel[rcEob]
+    const eobTok = Math.min(lvEob, 3) - 1
+    this.msac.encodeSymbol(this.cdf.data, eobBase + eobCtx * 4, 2, eobTok)
+    if (eobTok === 2) {
+      const hctx = (xE | yE) > 1 ? 14 : 7
+      this.encodeHiTok(hiBase + hctx * 4, lvEob)
+      levels[rcEob] = (Math.min(lvEob, 15) + (3 << 6)) & 0xFF
+    }
+    else {
+      levels[rcEob] = (lvEob * 0x41) & 0xFF
+    }
+
+    // remaining AC coefficients, descending scan order.
+    for (let i = eob - 1; i > 0; i--) {
+      const rc = SCAN_4X4[i]
+      const x = rc >> RC_SHIFT
+      const y = rc & RC_MASK
+      let mag = levels[rc + 1] + levels[rc + LEVEL_STRIDE] + levels[rc + LEVEL_STRIDE + 1]
+      const hiMag = mag
+      mag += levels[rc + 2] + levels[rc + 2 * LEVEL_STRIDE]
+      const loCtx = LO_CTX_OFFSETS[Math.min(y, 4) * 5 + Math.min(x, 4)]
+        + (mag > 512 ? 4 : (mag + 64) >> 7)
+      const lv = absLevel[rc]
+      const base = Math.min(lv, 3)
+      this.msac.encodeSymbol(this.cdf.data, loBase + loCtx * 4, 3, base)
+      if (base === 3) {
+        const m = hiMag & 63
+        const hctx = ((x | y) > 1 ? 14 : 7) + (m > 12 ? 6 : (m + 1) >> 1)
+        this.encodeHiTok(hiBase + hctx * 4, lv)
+        levels[rc] = (Math.min(lv, 15) + (3 << 6)) & 0xFF
+      }
+      else {
+        levels[rc] = (base * 0x41) & 0xFF
+      }
+    }
+
+    // DC coefficient (context 0 for TWO_D).
+    const lvDc = absLevel[0]
+    const baseDc = Math.min(lvDc, 3)
+    this.msac.encodeSymbol(this.cdf.data, loBase, 3, baseDc)
+    if (baseDc === 3) {
+      const m = (levels[1] + levels[LEVEL_STRIDE] + levels[LEVEL_STRIDE + 1]) & 63
+      const hctx = m > 12 ? 6 : (m + 1) >> 1
+      this.encodeHiTok(hiBase + hctx * 4, lvDc)
+    }
+  }
+
+  /**
+   * Emit DC/AC signs and Golomb tails, and build the dequantized coefficient
+   * array `this.cf` used for reconstruction. Returns the cumulative level.
+   */
+  private encodeSignsAndDequant(
+    chroma: number,
+    eob: number,
+    aArr: Uint8Array,
+    aOff: number,
+    lArr: Uint8Array,
+    lOff: number,
+  ): number {
+    const { absLevel, signBit, cf } = this
+    cf.fill(0)
+    let culLevel = 0
+
+    // DC (position 0).
+    const dcLv = absLevel[0]
+    if (dcLv !== 0) {
+      const dcSignCtx = this.dcSignCtx(aArr, aOff, lArr, lOff)
+      const neg = signBit[0]
+      this.msac.encodeBoolAdapt(this.cdf.data, this.cdf.offset('dc_sign', chroma, dcSignCtx), neg)
+      let dq: number
+      if (dcLv >= 15) {
+        this.msac.writeGolomb(dcLv - 15)
+        dq = Math.min((this.dqDc * dcLv) & 0xFFFFFF, CF_MAX + neg)
+      }
+      else {
+        dq = this.dqDc * dcLv
+      }
+      cf[0] = neg ? -dq : dq
+      culLevel += dcLv
+    }
+
+    // AC coefficients in ascending scan order (the decoder's chain order).
+    for (let i = 1; i <= eob; i++) {
+      const rc = SCAN_4X4[i]
+      const lv = absLevel[rc]
+      if (lv === 0)
+        continue
+      const neg = signBit[rc]
+      this.msac.encodeBoolEqui(neg)
+      let dq: number
+      if (lv >= 15) {
+        this.msac.writeGolomb(lv - 15)
+        dq = Math.min((this.dqAc * lv) & 0xFFFFFF, CF_MAX + neg)
+      }
+      else {
+        dq = this.dqAc * lv
+      }
+      cf[rc] = neg ? -dq : dq
+      culLevel += lv
+    }
+
+    return culLevel
+  }
+
+  /** dc_sign context from the neighbor coefficient-sign state (4x4: w=h=1). */
+  private dcSignCtx(aArr: Uint8Array, aOff: number, lArr: Uint8Array, lOff: number): number {
+    let s = -2 + (aArr[aOff] >> 6) + (lArr[lOff] >> 6)
+    s = (s !== 0 ? 1 : 0) + (s > 0 ? 1 : 0)
+    return s
+  }
+
+  /** Encode a base-range (br_tok) level in [3, 15], capping at 15 like the decoder. */
+  private encodeHiTok(cdfOff: number, level: number): void {
+    const lv = Math.min(level, 15)
     for (const base of [3, 6, 9, 12]) {
-      const symbol = Math.min(remaining - base, 3)
+      const symbol = Math.min(lv - base, 3)
       this.msac.encodeSymbol(this.cdf.data, cdfOff, 3, symbol)
       if (symbol < 3)
         return
     }
   }
-}
-
-function chooseDcToken(delta: number, dq: number): { token: number, residual: number } {
-  const negative = delta < 0
-  const estimate = Math.max(0, Math.round(Math.abs(delta) * 32 / dq))
-  let bestToken = 0
-  let bestResidual = 0
-  let bestError = Math.abs(delta)
-  const lo = Math.max(1, estimate - 12)
-  const hi = Math.min(4095, Math.max(16, estimate + 12))
-  for (let token = lo; token <= hi; token++) {
-    const residual = dct4DcResidual((negative ? -1 : 1) * dq * token)
-    const error = Math.abs(delta - residual)
-    if (error < bestError) {
-      bestToken = token
-      bestResidual = residual
-      bestError = error
-    }
-  }
-  return { token: bestToken, residual: bestResidual }
-}
-
-function dct4DcResidual(coefficient: number): number {
-  let dc = (coefficient * 181 + 128) >> 8
-  dc = (dc * 181 + 128 + 2048) >> 12
-  return dc
 }
 
 function dcPredict(plane: Uint8Array, stride: number, px: number, py: number): number {
