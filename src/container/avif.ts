@@ -9,8 +9,7 @@
  *   - `iloc` construction_method 1 (`idat`-relative payloads)
  *   - `irot` / `imir` display transforms
  */
-import type { AV1CodecConfig } from '../types'
-import type { ISOBMFFBox } from './heif'
+import type { AV1CodecConfig, ISOBMFFBox } from '../types'
 import { findBox, parseAv1C, parseIinf, parseIloc, parseIspe, parsePixi } from './heif'
 
 export interface AvifGridInfo {
