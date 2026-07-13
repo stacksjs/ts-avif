@@ -1,6 +1,7 @@
-export { decode, getAvifMetadata } from './decoder'
+export { decode, decodeSequence, getAvifMetadata } from './decoder'
 export type { AvifGridInfo, AvifItemInfo } from './container/avif'
 export { getAvifItemInfo, getItemPayload, parseGridBody, parseIpma, parseIref, parsePitm } from './container/avif'
+export { getAvifTrack } from './container/sequence'
 export { encode, encodeAsync, encodeAV1, qualityToQIndex } from './encoder'
 export { optimize, optimizeWithStats, remux } from './optimize'
 export type { OptimizeResult, OptimizeStats } from './optimize'
@@ -18,9 +19,11 @@ export {
   parseAv1C,
 } from './container/heif'
 export { parseOBUs, createOBU, getOBUTypeName, writeLeb128 } from './av1/obu'
-export { decodeAV1 } from './av1/decoder'
+export { decodeAV1, decodeAV1Sequence } from './av1/decoder'
 export type {
   AvifImageData,
+  AvifAnimation,
+  AvifAnimationFrame,
   AvifEncodeOptions,
   AvifDecodeOptions,
   AvifInfo,

@@ -1,6 +1,6 @@
-import type { AvifDecodeOptions, AvifImageData } from './types'
+import type { AvifAnimation, AvifDecodeOptions, AvifImageData } from './types'
 import type { AvifItemInfo } from './container/avif'
-import { decodeAV1 } from './av1/decoder'
+import { decodeAV1, decodeAV1Sequence } from './av1/decoder'
 import { getAvifItemInfo, getItemPayload } from './container/avif'
 import {
   findBox,
@@ -9,6 +9,7 @@ import {
   parseIinf,
   validateFtyp,
 } from './container/heif'
+import { getAvifTrack } from './container/sequence'
 
 
 /**
@@ -78,6 +79,27 @@ export function decode(
   }
 
   return imageData
+}
+
+/** Decode every presentation sample in an animated AVIF sequence. */
+export function decodeSequence(
+  buffer: Uint8Array | ArrayBuffer,
+  options: AvifDecodeOptions = {},
+): AvifAnimation {
+  const data = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer
+  if (!validateFtyp(data)) throw new Error('Invalid AVIF file: not a valid AVIF or HEIF file')
+  const boxes = parseISOBMFF(data)
+  const track = getAvifTrack(data, boxes)
+  const decoded = decodeAV1Sequence(track.samples.map(sample => sample.data))
+  let timestamp = 0
+  const frames = decoded.map((image, index) => {
+    const duration = track.samples[index].duration
+    if (options.format === 'rgb') image.data = rgbaToRgb(image.data)
+    const frame = { ...image, duration, timestamp }
+    timestamp += duration
+    return frame
+  })
+  return { frames, timescale: track.timescale, duration: track.duration }
 }
 
 function getPrimaryItemId(boxes: any[]): number | null {

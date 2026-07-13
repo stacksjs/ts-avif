@@ -14,6 +14,19 @@ export interface AvifImageData {
   bitDepth?: 8 | 10 | 12
 }
 
+export interface AvifAnimationFrame extends AvifImageData {
+  /** Presentation duration in the animation's timescale. */
+  duration: number
+  /** Presentation timestamp in the animation's timescale. */
+  timestamp: number
+}
+
+export interface AvifAnimation {
+  frames: AvifAnimationFrame[]
+  timescale: number
+  duration: number
+}
+
 /**
  * AVIF encoding options
  */
