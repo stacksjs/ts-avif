@@ -7,7 +7,7 @@ import { parseOBUs } from '../src/av1/obu'
 import { OBUType } from '../src/types'
 
 // A real AVIF (photo, 512x384, single av01 item) with a q95 JPEG ground
-// truth for the future entropy decoder's PSNR gate.
+// truth for the visual PSNR gate and a dav1d RGBA digest for bit-exactness.
 const fixture = new Uint8Array(
   readFileSync(join(import.meta.dir, 'fixtures', 'photo-small.avif')),
 )
@@ -36,11 +36,13 @@ describe('item payload (real file)', () => {
 })
 
 describe('decode (real file)', () => {
-  it('decodes photo-small.avif within 30dB PSNR of the ground truth', () => {
+  it('decodes photo-small.avif bit-exactly with at least 45dB PSNR', () => {
     const img = decode(fixture)
     expect(img.width).toBe(512)
     expect(img.height).toBe(384)
     expect(img.data.length).toBe(512 * 384 * 4)
+    expect(new Bun.CryptoHasher('sha256').update(img.data).digest('hex'))
+      .toBe('49a8de75537bed96752f3c082bcbebf310f87a647626eebdaf6b52f672614d4a')
 
     const truth = decodeJpeg(
       readFileSync(join(import.meta.dir, 'fixtures', 'photo-small.groundtruth.jpg')),
@@ -61,6 +63,6 @@ describe('decode (real file)', () => {
     }
     const mse = sse / n
     const psnr = 10 * Math.log10((255 * 255) / mse)
-    expect(psnr).toBeGreaterThanOrEqual(30)
+    expect(psnr).toBeGreaterThanOrEqual(45)
   })
 })
