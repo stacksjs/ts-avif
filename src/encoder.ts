@@ -1,506 +1,82 @@
 import type { AvifEncodeOptions, AvifImageData } from './types'
 import { OBUType } from './types'
-import { createOBU, writeLeb128 } from './av1/obu'
-import { createFtyp } from './container/heif'
-import { encodeViaAvifenc, hasAvifenc } from './encoder-cli'
+import { encodeFrameHeader, encodeSequenceHeader } from './av1/encode-headers'
+import { encodeIntraTile, rgbaToYuv420 } from './av1/encode-tile'
+import { createOBU } from './av1/obu'
+import { writeAvif } from './container/writer'
 
-/**
- * Encode RGBA pixel data to AVIF format.
- *
- * Tries `avifenc` (libavif CLI) first when available — that's the
- * only path that produces real AV1 image data. The bundled fallback
- * builds a syntactically valid container around stub frame bytes;
- * fine for testing the container layout, useless for actual delivery.
- *
- * Set `options.backend = 'pure-ts'` to force the bundled path (e.g.
- * for tests that assert container structure without depending on a
- * system binary).
- */
+/** Encode opaque 8-bit RGBA pixels with the bundled TypeScript AV1 encoder. */
 export function encode(
   imageData: AvifImageData,
   options: AvifEncodeOptions = {},
 ): Uint8Array {
-  const { width, height, data } = imageData
-  const { quality = 80, lossless = false } = options
-
-  // Create AV1 bitstream
-  const av1Data = encodeAV1(data, width, height, { quality, lossless })
-
-  // Create AVIF container
-  return createAvifContainer(av1Data, width, height, imageData.hasAlpha)
+  validateOptions(imageData, options)
+  const av1 = encodeAV1(imageData.data, imageData.width, imageData.height, options)
+  return writeAvif(av1, imageData.width, imageData.height)
 }
 
-/**
- * Async-aware encoder that tries `avifenc` (libavif) first when
- * available — that's the only path producing real AV1 image data.
- * Falls back to the bundled stub encoder when the binary is missing
- * (the stub writes a valid AVIF container around placeholder frame
- * bytes; useful for testing layout, not for real delivery).
- *
- * New code should prefer this over `encode()` for any production
- * output.
- */
+/** Promise-returning form retained for callers with an asynchronous pipeline. */
 export async function encodeAsync(
   imageData: AvifImageData,
   options: AvifEncodeOptions = {},
 ): Promise<Uint8Array> {
-  const backend = options.backend ?? 'auto'
-
-  if (backend !== 'pure-ts') {
-    if (await hasAvifenc(options.avifencPath)) {
-      const cliBytes = await encodeViaAvifenc(imageData, options)
-      if (cliBytes) return cliBytes
-    }
-    if (backend === 'cli') {
-      throw new Error(
-        'ts-avif: avifenc binary not found on PATH (or failed). '
-        + 'Install libavif (`brew install libavif` / `apt-get install libavif-tools`), '
-        + 'set options.avifencPath, or use backend: "pure-ts".',
-      )
-    }
-  }
-
   return encode(imageData, options)
 }
 
-function encodeAV1(
-  data: Uint8Array,
+/** Encode an AV1 low-overhead OBU stream without the AVIF container. */
+export function encodeAV1(
+  rgba: Uint8Array,
   width: number,
   height: number,
-  _options: { quality: number, lossless: boolean },
+  options: AvifEncodeOptions = {},
 ): Uint8Array {
-  // Create sequence header OBU
-  const seqHeader = createSequenceHeader(width, height)
-  const seqHeaderOBU = createOBU(OBUType.SEQUENCE_HEADER, seqHeader)
-
-  // Create frame OBU (simplified - just placeholder for now)
-  const frame = createSimpleFrame(data, width, height)
-  const frameOBU = createOBU(OBUType.FRAME, frame)
-
-  // Concatenate OBUs
-  const totalLength = seqHeaderOBU.length + frameOBU.length
-  const result = new Uint8Array(totalLength)
-  result.set(seqHeaderOBU, 0)
-  result.set(frameOBU, seqHeaderOBU.length)
-
-  return result
+  validateCodecOptions(options)
+  const q = qualityToQIndex(options.quality ?? 80)
+  const sequence = createOBU(OBUType.SEQUENCE_HEADER, encodeSequenceHeader(width, height))
+  const frameHeader = encodeFrameHeader(width, height, q)
+  const tile = encodeIntraTile(rgbaToYuv420(rgba, width, height), q)
+  const framePayload = concat([frameHeader, tile])
+  const frame = createOBU(OBUType.FRAME, framePayload)
+  return concat([sequence, frame])
 }
 
-function createSequenceHeader(width: number, height: number): Uint8Array {
-  const buffer: number[] = []
-
-  // For a complete implementation, this would properly encode:
-  // - seq_profile
-  // - still_picture
-  // - reduced_still_picture_header
-  // - timing_info
-  // - decoder_model_info
-  // - operating_points
-  // - frame dimensions
-  // - color_config
-
-  // Simplified sequence header for still picture
-  // seq_profile = 0, still_picture = 1, reduced_still_picture_header = 1
-  buffer.push(0b00011000) // seq_profile (0) + still_picture (1) + reduced (1)
-
-  // seq_level_idx (level 2.0 = 0)
-  buffer.push(0x00)
-
-  // Frame width bits - 1 (calculate how many bits needed)
-  const widthBits = Math.ceil(Math.log2(width + 1))
-  const heightBits = Math.ceil(Math.log2(height + 1))
-
-  buffer.push(((widthBits - 1) << 4) | (heightBits - 1))
-
-  // Frame width - 1
-  const widthBytes = writeLeb128(width - 1)
-  for (const b of widthBytes) {
-    buffer.push(b)
-  }
-
-  // Frame height - 1
-  const heightBytes = writeLeb128(height - 1)
-  for (const b of heightBytes) {
-    buffer.push(b)
-  }
-
-  return new Uint8Array(buffer)
+/** Map the public quality scale to AV1's inverse 8-bit base quantizer. */
+export function qualityToQIndex(quality: number): number {
+  if (!Number.isFinite(quality) || quality < 0 || quality > 100)
+    throw new RangeError('ts-avif: quality must be between 0 and 100')
+  return Math.max(1, Math.min(255, Math.round((100 - quality) * 2.55)))
 }
 
-function createSimpleFrame(
-  _data: Uint8Array,
-  width: number,
-  height: number,
-): Uint8Array {
-  // For a complete implementation, this would:
-  // 1. Convert RGB to YUV
-  // 2. Apply prediction
-  // 3. Apply transforms (DCT/ADST)
-  // 4. Quantize coefficients
-  // 5. Entropy encode
-
-  // Placeholder: create minimal valid frame data
-  const buffer: number[] = []
-
-  // Frame header (simplified)
-  buffer.push(0x00) // show_existing_frame = 0, frame_type = KEY_FRAME
-
-  // Minimal frame data
-  for (let i = 0; i < Math.min(100, width * height); i++) {
-    buffer.push(0x00)
-  }
-
-  return new Uint8Array(buffer)
+function validateOptions(imageData: AvifImageData, options: AvifEncodeOptions): void {
+  const { width, height, data } = imageData
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1)
+    throw new RangeError('ts-avif: width and height must be positive integers')
+  if (width > 4096 || height > 2304)
+    throw new RangeError('ts-avif: pure TypeScript encoder currently supports frames up to 4096x2304')
+  if (data.byteLength !== width * height * 4)
+    throw new Error('ts-avif: imageData.data must be RGBA (width × height × 4 bytes)')
+  if (imageData.bitDepth !== undefined && imageData.bitDepth !== 8)
+    throw new Error('ts-avif: pure TypeScript encoder currently supports only 8-bit input')
+  if (options.alpha || imageData.hasAlpha)
+    throw new Error('ts-avif: alpha encoding is not implemented yet')
+  validateCodecOptions(options)
 }
 
-function createAvifContainer(
-  av1Data: Uint8Array,
-  width: number,
-  height: number,
-  _hasAlpha?: boolean,
-): Uint8Array {
-  // Create ftyp box
-  const ftyp = createFtyp()
+function validateCodecOptions(options: AvifEncodeOptions): void {
+  if (options.lossless)
+    throw new Error('ts-avif: lossless AV1 encoding is not implemented yet')
+  if (options.chromaSubsampling && options.chromaSubsampling !== '4:2:0')
+    throw new Error('ts-avif: pure TypeScript encoder currently supports only 4:2:0 chroma')
+  qualityToQIndex(options.quality ?? 80)
+}
 
-  // Create meta box
-  const meta = createMetaBox(width, height, av1Data.length)
-
-  // Create mdat box
-  const mdat = createMdatBox(av1Data)
-
-  // Concatenate all boxes
-  const totalSize = ftyp.length + meta.length + mdat.length
-  const result = new Uint8Array(totalSize)
-
+function concat(parts: Uint8Array[]): Uint8Array {
+  const size = parts.reduce((sum, part) => sum + part.length, 0)
+  const out = new Uint8Array(size)
   let offset = 0
-  result.set(ftyp, offset)
-  offset += ftyp.length
-
-  result.set(meta, offset)
-  offset += meta.length
-
-  result.set(mdat, offset)
-
-  return result
-}
-
-function createMetaBox(width: number, height: number, dataSize: number): Uint8Array {
-  // Create hdlr box (handler)
-  const hdlr = createHdlrBox()
-
-  // Create pitm box (primary item)
-  const pitm = createPitmBox(1)
-
-  // Create iloc box (item location)
-  const iloc = createIlocBox(1, dataSize)
-
-  // Create iinf box (item info)
-  const iinf = createIinfBox()
-
-  // Create iprp box (item properties)
-  const iprp = createIprpBox(width, height)
-
-  // Calculate meta box size
-  const childrenSize = hdlr.length + pitm.length + iloc.length + iinf.length + iprp.length
-  const metaSize = 12 + childrenSize // 8 (box header) + 4 (version/flags)
-
-  const meta = new Uint8Array(metaSize)
-  const view = new DataView(meta.buffer)
-
-  // Box header
-  view.setUint32(0, metaSize)
-  meta[4] = 0x6D // m
-  meta[5] = 0x65 // e
-  meta[6] = 0x74 // t
-  meta[7] = 0x61 // a
-
-  // Version and flags
-  view.setUint32(8, 0)
-
-  // Children
-  let offset = 12
-  meta.set(hdlr, offset)
-  offset += hdlr.length
-
-  meta.set(pitm, offset)
-  offset += pitm.length
-
-  meta.set(iloc, offset)
-  offset += iloc.length
-
-  meta.set(iinf, offset)
-  offset += iinf.length
-
-  meta.set(iprp, offset)
-
-  return meta
-}
-
-function createHdlrBox(): Uint8Array {
-  const size = 32
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x68 // h
-  buffer[5] = 0x64 // d
-  buffer[6] = 0x6C // l
-  buffer[7] = 0x72 // r
-
-  // Version and flags
-  view.setUint32(8, 0)
-
-  // Pre-defined
-  view.setUint32(12, 0)
-
-  // Handler type: 'pict'
-  buffer[16] = 0x70 // p
-  buffer[17] = 0x69 // i
-  buffer[18] = 0x63 // c
-  buffer[19] = 0x74 // t
-
-  // Reserved
-  view.setUint32(20, 0)
-  view.setUint32(24, 0)
-  view.setUint32(28, 0)
-
-  return buffer
-}
-
-function createPitmBox(primaryItemId: number): Uint8Array {
-  const size = 14
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x70 // p
-  buffer[5] = 0x69 // i
-  buffer[6] = 0x74 // t
-  buffer[7] = 0x6D // m
-
-  // Version and flags
-  view.setUint32(8, 0)
-
-  // Item ID
-  view.setUint16(12, primaryItemId)
-
-  return buffer
-}
-
-function createIlocBox(itemId: number, dataSize: number): Uint8Array {
-  const size = 30 // 8 (header) + 4 (version/flags) + 2 (offset/length sizes) + 2 (item count) + 2 (item id) + 2 (data ref) + 2 (extent count) + 4 (offset) + 4 (length)
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x69 // i
-  buffer[5] = 0x6C // l
-  buffer[6] = 0x6F // o
-  buffer[7] = 0x63 // c
-
-  // Version 0, flags 0
-  view.setUint32(8, 0)
-
-  // offset_size (4) << 4 | length_size (4)
-  buffer[12] = 0x44
-
-  // base_offset_size (0) << 4 | reserved (0)
-  buffer[13] = 0x00
-
-  // Item count
-  view.setUint16(14, 1)
-
-  // Item ID
-  view.setUint16(16, itemId)
-
-  // Data reference index
-  view.setUint16(18, 0)
-
-  // Extent count
-  view.setUint16(20, 1)
-
-  // Extent offset (will be set to mdat offset)
-  view.setUint32(22, 0)
-
-  // Extent length
-  view.setUint32(26, dataSize)
-
-  return buffer
-}
-
-function createIinfBox(): Uint8Array {
-  // Create infe entry for av01 item
-  const infe = createInfeBox(1, 'av01')
-
-  const size = 14 + infe.length
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x69 // i
-  buffer[5] = 0x69 // i
-  buffer[6] = 0x6E // n
-  buffer[7] = 0x66 // f
-
-  // Version 0, flags 0
-  view.setUint32(8, 0)
-
-  // Entry count
-  view.setUint16(12, 1)
-
-  // infe entry
-  buffer.set(infe, 14)
-
-  return buffer
-}
-
-function createInfeBox(itemId: number, itemType: string): Uint8Array {
-  const size = 21
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x69 // i
-  buffer[5] = 0x6E // n
-  buffer[6] = 0x66 // f
-  buffer[7] = 0x65 // e
-
-  // Version 2, flags 0
-  view.setUint32(8, 0x02000000)
-
-  // Item ID
-  view.setUint16(12, itemId)
-
-  // Item protection index
-  view.setUint16(14, 0)
-
-  // Item type
-  for (let i = 0; i < 4; i++) {
-    buffer[16 + i] = itemType.charCodeAt(i)
+  for (const part of parts) {
+    out.set(part, offset)
+    offset += part.length
   }
-
-  // Item name (null terminated)
-  buffer[20] = 0
-
-  return buffer
-}
-
-function createIprpBox(width: number, height: number): Uint8Array {
-  // Create ipco (item property container)
-  const ispe = createIspeBox(width, height)
-  const av1c = createAv1CBox()
-
-  const ipcoSize = 8 + ispe.length + av1c.length
-  const ipco = new Uint8Array(ipcoSize)
-  const ipcoView = new DataView(ipco.buffer)
-
-  ipcoView.setUint32(0, ipcoSize)
-  ipco[4] = 0x69 // i
-  ipco[5] = 0x70 // p
-  ipco[6] = 0x63 // c
-  ipco[7] = 0x6F // o
-
-  ipco.set(ispe, 8)
-  ipco.set(av1c, 8 + ispe.length)
-
-  // Create ipma (item property association)
-  const ipma = createIpmaBox()
-
-  // Create iprp box
-  const size = 8 + ipco.length + ipma.length
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x69 // i
-  buffer[5] = 0x70 // p
-  buffer[6] = 0x72 // r
-  buffer[7] = 0x70 // p
-
-  buffer.set(ipco, 8)
-  buffer.set(ipma, 8 + ipco.length)
-
-  return buffer
-}
-
-function createIspeBox(width: number, height: number): Uint8Array {
-  const size = 20
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x69 // i
-  buffer[5] = 0x73 // s
-  buffer[6] = 0x70 // p
-  buffer[7] = 0x65 // e
-
-  // Version and flags
-  view.setUint32(8, 0)
-
-  // Width
-  view.setUint32(12, width)
-
-  // Height
-  view.setUint32(16, height)
-
-  return buffer
-}
-
-function createAv1CBox(): Uint8Array {
-  const size = 12
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x61 // a
-  buffer[5] = 0x76 // v
-  buffer[6] = 0x31 // 1
-  buffer[7] = 0x43 // C
-
-  // AV1 codec configuration
-  buffer[8] = 0x81 // marker (1) + version (1)
-  buffer[9] = 0x00 // seq_profile (0) + seq_level_idx_0 (0)
-  buffer[10] = 0x00 // seq_tier_0 (0) + high_bitdepth (0) + twelve_bit (0) + monochrome (0) + chroma_subsampling_x (0) + chroma_subsampling_y (0)
-  buffer[11] = 0x00 // chroma_sample_position (0)
-
-  return buffer
-}
-
-function createIpmaBox(): Uint8Array {
-  const size = 18 // 8 (header) + 4 (version/flags) + 4 (entry count) + 2 (item id)
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x69 // i
-  buffer[5] = 0x70 // p
-  buffer[6] = 0x6D // m
-  buffer[7] = 0x61 // a
-
-  // Version 0, flags 0
-  view.setUint32(8, 0)
-
-  // Entry count
-  view.setUint32(12, 1)
-
-  // Item ID
-  view.setUint16(16, 1)
-
-  return buffer
-}
-
-function createMdatBox(data: Uint8Array): Uint8Array {
-  const size = 8 + data.length
-  const buffer = new Uint8Array(size)
-  const view = new DataView(buffer.buffer)
-
-  view.setUint32(0, size)
-  buffer[4] = 0x6D // m
-  buffer[5] = 0x64 // d
-  buffer[6] = 0x61 // a
-  buffer[7] = 0x74 // t
-
-  buffer.set(data, 8)
-
-  return buffer
+  return out
 }

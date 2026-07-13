@@ -60,10 +60,19 @@ describe('ts-avif', () => {
       const encoded1 = avif.encode(image1)
       const encoded2 = avif.encode(image2)
 
-      // Files should be the same (since encoder is simplified)
-      // but have valid structure
-      expect(encoded1.length).toBeGreaterThan(0)
-      expect(encoded2.length).toBeGreaterThan(0)
+      expect(encoded1).not.toEqual(encoded2)
+    })
+
+    it('round-trips encoded pixels through the bundled decoder', () => {
+      const image = createTestImageData(17, 9, { r: 30, g: 120, b: 220, a: 255 })
+      const decoded = avif.decode(avif.encode(image, { quality: 80 }))
+
+      expect(decoded.width).toBe(17)
+      expect(decoded.height).toBe(9)
+      let blueMean = 0
+      for (let i = 2; i < decoded.data.length; i += 4)
+        blueMean += decoded.data[i]
+      expect(blueMean / (17 * 9)).toBeGreaterThan(200)
     })
 
     it('creates AVIF with ftyp box containing avif brand', () => {
@@ -227,11 +236,9 @@ describe('ts-avif', () => {
       expect(encoded.length).toBeGreaterThan(0)
     })
 
-    it('accepts lossless option', () => {
+    it('rejects unsupported lossless encoding loudly', () => {
       const imageData = createTestImageData(5, 5, { r: 128, g: 128, b: 128, a: 255 })
-
-      const encoded = avif.encode(imageData, { lossless: true })
-      expect(encoded.length).toBeGreaterThan(0)
+      expect(() => avif.encode(imageData, { lossless: true })).toThrow(/lossless AV1 encoding is not implemented/)
     })
   })
 

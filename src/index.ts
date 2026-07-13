@@ -1,8 +1,7 @@
 export { decode, getAvifMetadata } from './decoder'
 export type { AvifGridInfo, AvifItemInfo } from './container/avif'
 export { getAvifItemInfo, getItemPayload, parseGridBody, parseIpma, parseIref, parsePitm } from './container/avif'
-export { encode, encodeAsync } from './encoder'
-export { encodeViaAvifenc, hasAvifenc } from './encoder-cli'
+export { encode, encodeAsync, encodeAV1, qualityToQIndex } from './encoder'
 export { optimize, optimizeWithStats, remux } from './optimize'
 export type { OptimizeResult, OptimizeStats } from './optimize'
 export {

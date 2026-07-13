@@ -22,26 +22,12 @@ export interface AvifEncodeOptions {
   quality?: number
   /** Use lossless encoding */
   lossless?: boolean
-  /** Speed/effort trade-off (0-10, default: 6) */
+  /** Reserved speed/effort trade-off (0-10); currently ignored. */
   effort?: number
-  /** Enable alpha channel */
+  /** Enable alpha channel (not implemented; throws when true). */
   alpha?: boolean
-  /** Chroma subsampling (default: '4:2:0') */
+  /** Chroma subsampling (only '4:2:0' is currently supported). */
   chromaSubsampling?: '4:2:0' | '4:2:2' | '4:4:4'
-  /**
-   * Encoder backend selection.
-   *
-   *   - `'auto'` (default): try the system `avifenc` binary; fall back
-   *     to the pure-TS encoder when it isn't on PATH or fails. Note:
-   *     the pure-TS path is currently a stub — it produces a valid
-   *     AVIF container with placeholder frame data. Use `'auto'` (or
-   *     install libavif) for real output.
-   *   - `'cli'`: require the `avifenc` binary; throw if it's missing.
-   *   - `'pure-ts'`: always use the bundled stub encoder (legacy).
-   */
-  backend?: 'auto' | 'cli' | 'pure-ts'
-  /** Override the path to the `avifenc` binary. */
-  avifencPath?: string
 }
 
 /**
