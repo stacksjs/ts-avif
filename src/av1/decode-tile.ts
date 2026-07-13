@@ -95,6 +95,9 @@ export interface Av1Block {
   palettes: [Uint16Array, Uint16Array, Uint16Array]
   palIdxY: Uint8Array | null
   palIdxUv: Uint8Array | null
+  /** Motion vector in AV1's 1/8-pixel units (integer-valued for intrabc). */
+  mvX: number
+  mvY: number
   tx: number
   uvtx: number
 }
@@ -119,6 +122,8 @@ class BlockContext {
   palSz: Uint8Array
   palSzUv: Uint8Array
   palettes: [Uint16Array, Uint16Array, Uint16Array]
+  mvX: Int16Array
+  mvY: Int16Array
 
   constructor(n4: number) {
     this.mode = new Uint8Array(n4)
@@ -135,6 +140,8 @@ class BlockContext {
     this.palSz = new Uint8Array(n4)
     this.palSzUv = new Uint8Array(n4)
     this.palettes = [new Uint16Array(n4 * 8), new Uint16Array(n4 * 8), new Uint16Array(n4 * 8)]
+    this.mvX = new Int16Array(n4)
+    this.mvY = new Int16Array(n4)
   }
 
   reset(keyframe: boolean): void {
@@ -153,6 +160,8 @@ class BlockContext {
     this.segPred.fill(0)
     this.palSz.fill(0)
     this.palSzUv.fill(0)
+    this.mvX.fill(0)
+    this.mvY.fill(0)
   }
 }
 
@@ -209,6 +218,9 @@ export class TileDecoder {
   levels = new Uint8Array(1088)
   cdefIdx = [-1, -1, -1, -1]
 
+  /** Independently adapted vertical/horizontal MV component CDFs. */
+  mvCdf: [Uint16Array, Uint16Array]
+
   /** Per-4x4 segment id map for the whole frame (spatial prediction). */
   segMap: Uint8Array | null = null
 
@@ -241,6 +253,12 @@ export class TileDecoder {
     this.a = new BlockContext(aligned)
     this.l = new BlockContext(32)
     this.a.reset(true)
+
+    // The packed default context stores one MV component template; the two
+    // components adapt independently once tile decoding begins.
+    const mvBase = cdf.offset('mv_classes')
+    const mvTemplate = cdf.data.slice(mvBase, cdf.offset('mv_joint'))
+    this.mvCdf = [mvTemplate.slice(), mvTemplate.slice()]
 
     this.frameDq = []
     for (let seg = 0; seg < 8; seg++)
@@ -483,6 +501,8 @@ export class TileDecoder {
       palettes: [new Uint16Array(8), new Uint16Array(8), new Uint16Array(8)],
       palIdxY: null,
       palIdxUv: null,
+      mvX: 0,
+      mvY: 0,
       tx: TxfmSize.TX_4X4,
       uvtx: TxfmSize.TX_4X4,
     }
@@ -583,12 +603,13 @@ export class TileDecoder {
     }
 
     // intra flag: key/intra frames without intrabc are always intra
-    if (hdr.allowIntrabc) {
-      const isIntra = !msac.decodeBoolAdapt(cdf.data, cdf.offset('intrabc'))
-      if (!isIntra)
-        throw new Error('ts-avif: intra block copy is not supported yet')
+    b.intra = hdr.allowIntrabc
+      ? 1 - msac.decodeBoolAdapt(cdf.data, cdf.offset('intrabc'))
+      : 1
+    if (!b.intra) {
+      this.decodeIntrabcBlock(bs, b, bw4, bh4, w4, h4, cbw4, cbh4, hasChroma, bx4, by4)
+      return
     }
-    b.intra = 1
 
     // y mode (key-frame contexts from neighbors)
     const ctxA = INTRA_MODE_CONTEXT[this.a.mode[bx4]]
@@ -739,6 +760,172 @@ export class TileDecoder {
       this.a.uvmode.fill(b.uvMode, cbx4, cbx4 + cbw4)
       this.l.uvmode.fill(b.uvMode, cby4, cby4 + cbh4)
     }
+  }
+
+  /** Decode and reconstruct an intra-block-copy block in an intra frame. */
+  private decodeIntrabcBlock(
+    bs: BlockSize,
+    b: Av1Block,
+    bw4: number,
+    bh4: number,
+    w4: number,
+    h4: number,
+    cbw4: number,
+    cbh4: number,
+    hasChroma: boolean,
+    bx4: number,
+    by4: number,
+  ): void {
+    // AV1 derives the predictor from the nearest intrabc reference. Keep the
+    // two spatial candidates locally; a missing stack uses the normative
+    // superblock-relative fallback.
+    if (this.bx > this.colStart && this.l.intra[by4] === 0) {
+      b.mvX = this.l.mvX[by4]
+      b.mvY = this.l.mvY[by4]
+    }
+    else if (this.by > this.rowStart && this.a.intra[bx4] === 0) {
+      b.mvX = this.a.mvX[bx4]
+      b.mvY = this.a.mvY[bx4]
+    }
+    else if (this.by - (this.seq.use128x128Superblock ? 32 : 16) < this.rowStart) {
+      b.mvX = -(this.seq.use128x128Superblock ? 4096 : 2048) - 2048
+      b.mvY = 0
+    }
+    else {
+      b.mvX = 0
+      b.mvY = -(this.seq.use128x128Superblock ? 1024 : 512)
+    }
+    this.readMvResidual(b)
+    this.clipIntrabcMv(b, bw4, bh4, hasChroma)
+
+    b.yMode = IntraPredMode.DC_PRED
+    b.uvMode = IntraPredMode.DC_PRED
+    if (this.hdr.losslessArray[b.segId]) {
+      b.tx = TxfmSize.TX_4X4
+      b.uvtx = TxfmSize.TX_4X4
+    }
+    else {
+      b.tx = MAX_TXFM_SIZE_FOR_BS[bs * 4]
+      b.uvtx = MAX_TXFM_SIZE_FOR_BS[bs * 4 + this.layout]
+      if (!b.skip && this.hdr.txMode === 2)
+        throw new Error('ts-avif: variable transform trees for lossy intrabc are not implemented')
+    }
+
+    this.reconBIntra(bs, b, w4, h4, cbw4, cbh4, hasChroma, 0)
+
+    const tDim = TXFM_INFO[b.tx]
+    for (let i = 0; i < bw4; i++) {
+      const o = bx4 + i
+      this.a.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 2]
+      this.a.tx[o] = tDim.lw
+      this.a.mode[o] = IntraPredMode.DC_PRED
+      this.a.palSz[o] = 0
+      this.a.palSzUv[o] = 0
+      this.a.segPred[o] = 0
+      this.a.skipMode[o] = 0
+      this.a.intra[o] = 0
+      this.a.skip[o] = b.skip
+      this.a.mvX[o] = b.mvX
+      this.a.mvY[o] = b.mvY
+    }
+    for (let i = 0; i < bh4; i++) {
+      const o = by4 + i
+      this.l.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 3]
+      this.l.tx[o] = tDim.lh
+      this.l.mode[o] = IntraPredMode.DC_PRED
+      this.l.palSz[o] = 0
+      this.l.palSzUv[o] = 0
+      this.l.segPred[o] = 0
+      this.l.skipMode[o] = 0
+      this.l.intra[o] = 0
+      this.l.skip[o] = b.skip
+      this.l.mvX[o] = b.mvX
+      this.l.mvY[o] = b.mvY
+    }
+    if (hasChroma) {
+      const cbx4 = bx4 >> this.ssHor
+      const cby4 = by4 >> this.ssVer
+      this.a.uvmode.fill(IntraPredMode.DC_PRED, cbx4, cbx4 + cbw4)
+      this.l.uvmode.fill(IntraPredMode.DC_PRED, cby4, cby4 + cbh4)
+    }
+  }
+
+  private readMvResidual(b: Av1Block): void {
+    // MVJoint values are 0, horizontal, vertical, horizontal+vertical.
+    const joint = this.msac.decodeSymbol(this.cdf.data, this.cdf.offset('mv_joint'), 3)
+    if (joint & 2)
+      b.mvY += this.readMvComponent(0)
+    if (joint & 1)
+      b.mvX += this.readMvComponent(1)
+  }
+
+  private readMvComponent(component: 0 | 1): number {
+    const cdf = this.mvCdf[component]
+    const sign = this.msac.decodeBoolAdapt(cdf, 16)
+    const mvClass = this.msac.decodeSymbol(cdf, 0, 10)
+    let up: number
+    if (mvClass === 0) {
+      up = this.msac.decodeBoolAdapt(cdf, 18)
+    }
+    else {
+      up = 1 << mvClass
+      for (let bit = 0; bit < mvClass; bit++)
+        up |= this.msac.decodeBoolAdapt(cdf, 30 + bit * 2) << bit
+    }
+    // Intrabc forces integer precision, so the fractional bits are 0b111.
+    const diff = (up << 3 | 7) + 1
+    return sign ? -diff : diff
+  }
+
+  private clipIntrabcMv(b: Av1Block, bw4: number, bh4: number, hasChroma: boolean): void {
+    let borderLeft = this.colStart * 4
+    let borderTop = this.rowStart * 4
+    if (hasChroma) {
+      if (bw4 < 2 && this.ssHor) borderLeft += 4
+      if (bh4 < 2 && this.ssVer) borderTop += 4
+    }
+    let srcLeft = this.bx * 4 + (b.mvX >> 3)
+    let srcTop = this.by * 4 + (b.mvY >> 3)
+    let srcRight = srcLeft + bw4 * 4
+    let srcBottom = srcTop + bh4 * 4
+    const borderRight = ((this.colEnd + bw4 - 1) & ~(bw4 - 1)) * 4
+
+    if (srcLeft < borderLeft) {
+      srcRight += borderLeft - srcLeft
+      srcLeft = borderLeft
+    }
+    else if (srcRight > borderRight) {
+      srcLeft -= srcRight - borderRight
+      srcRight = borderRight
+    }
+    if (srcTop < borderTop) {
+      srcBottom += borderTop - srcTop
+      srcTop = borderTop
+    }
+
+    const sbShift = this.seq.use128x128Superblock ? 7 : 6
+    const sbx = (this.bx >> (sbShift - 2)) << sbShift
+    const sby = (this.by >> (sbShift - 2)) << sbShift
+    const sbSize = 1 << sbShift
+    if (srcBottom > sby && srcRight > sbx) {
+      if (srcTop - borderTop >= srcBottom - sby) {
+        srcTop -= srcBottom - sby
+        srcBottom = sby
+      }
+      else if (srcLeft - borderLeft >= srcRight - sbx) {
+        srcLeft -= srcRight - sbx
+        srcRight = sbx
+      }
+    }
+    if (srcBottom > sby + sbSize) {
+      srcTop -= srcBottom - (sby + sbSize)
+      srcBottom = sby + sbSize
+    }
+    if (srcBottom > sby && srcRight > sbx)
+      throw new Error('ts-avif: invalid intrabc motion vector overlaps its superblock')
+
+    b.mvX = (srcLeft - this.bx * 4) * 8
+    b.mvY = (srcTop - this.by * 4) * 8
   }
 
   private readPalettePlane(b: Av1Block, pl: number, szCtx: number, bx4: number, by4: number): void {
@@ -952,7 +1139,7 @@ export class TileDecoder {
                 b.tx,
                 bs,
                 b,
-                1,
+                b.intra,
                 0,
               )
               this.a.lcoef.fill(ctx, bx4 + x, bx4 + x + Math.min(tDim.w, this.bw4 - this.bx))
@@ -1014,7 +1201,7 @@ export class TileDecoder {
                   b.uvtx,
                   bs,
                   b,
-                  1,
+                  b.intra,
                   1 + pl,
                 )
                 const ctw = Math.min(uvTDim.w, (this.bw4 - this.bx + ssHor) >> ssHor)

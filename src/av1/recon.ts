@@ -123,6 +123,8 @@ export class PixelReconstructor {
 
     const bw4 = BLOCK_DIMENSIONS[bs * 4]
     const bh4 = BLOCK_DIMENSIONS[bs * 4 + 1]
+    if (!b.intra)
+      this.copyIntrabcPredictor(b, dec, bw4, bh4)
     if (b.palSz[0] && b.palIdxY) {
       const width = bw4 * 4
       const height = bh4 * 4
@@ -143,6 +145,28 @@ export class PixelReconstructor {
             plane[off + y * this.buf.uvStride + x] = b.palettes[pl][b.palIdxUv[y * width + x]]
         }
       }
+    }
+  }
+
+  private copyIntrabcPredictor(b: Av1Block, dec: TileDecoder, bw4: number, bh4: number): void {
+    for (let plane = 0; plane < (this.seq.monochrome ? 1 : 3); plane++) {
+      const ssHor = plane ? dec.ssHor : 0
+      const ssVer = plane ? dec.ssVer : 0
+      const width = ((bw4 + ssHor) >> ssHor) * 4
+      const height = ((bh4 + ssVer) >> ssVer) * 4
+      const dstX = (dec.bx >> ssHor) * 4
+      const dstY = (dec.by >> ssVer) * 4
+      const srcX = dstX + (b.mvX >> (3 + ssHor))
+      const srcY = dstY + (b.mvY >> (3 + ssVer))
+      const stride = this.buf.stride(plane)
+      const pixels = this.buf.plane(plane)
+      // Copy through a temporary block so a malformed/edge vector cannot
+      // turn row-wise writes into self-referential reads.
+      const block = pixels.slice(0, width * height)
+      for (let y = 0; y < height; y++)
+        block.set(pixels.subarray((srcY + y) * stride + srcX, (srcY + y) * stride + srcX + width), y * width)
+      for (let y = 0; y < height; y++)
+        pixels.set(block.subarray(y * width, (y + 1) * width), (dstY + y) * stride + dstX)
     }
   }
 
@@ -306,7 +330,7 @@ export class PixelReconstructor {
     const dstOff = 4 * bx + 4 * by * stride
 
     const usesPalette = b.palSz[plane === 0 ? 0 : 1] !== 0
-    if (!usesPalette && plane === 0) {
+    if (b.intra && !usesPalette && plane === 0) {
       let angle = b.yAngle
       const prep = prepareIntraEdges(
         bx,
@@ -344,7 +368,7 @@ export class PixelReconstructor {
         this.seq.bitDepth,
       )
     }
-    else if (!usesPalette) {
+    else if (b.intra && !usesPalette) {
       const skipPred = b.uvMode === IntraPredMode.CFL_PRED && b.cflAlpha[plane - 1] !== 0
       if (!skipPred) {
         const ssHor = dec.ssHor
