@@ -5,6 +5,7 @@ import { getAvifMetadata, getItemPayload, parseISOBMFF } from '../src'
 import { BitReader, ceilLog2, floorLog2 } from '../src/av1/bits'
 import { parseOBUs } from '../src/av1/obu'
 import { parseSequenceHeader } from '../src/av1/sequence'
+import { parseFrameOBU } from '../src/av1/tile-group'
 import { OBUType } from '../src/types'
 
 function bitsToBytes(bits: string): Uint8Array {
@@ -94,5 +95,43 @@ describe('parseSequenceHeader (real file)', () => {
     expect(seq.monochrome).toBe(meta.av1C!.monochrome === 1)
     expect(seq.subsamplingX).toBe(meta.av1C!.chromaSubsamplingX)
     expect(seq.subsamplingY).toBe(meta.av1C!.chromaSubsamplingY)
+  })
+})
+
+describe('parseFrameOBU (real file)', () => {
+  const fixture = new Uint8Array(
+    readFileSync(join(import.meta.dir, 'fixtures', 'photo-small.avif')),
+  )
+
+  it('parses the intra frame header and slices the tile group', () => {
+    const boxes = parseISOBMFF(fixture)
+    const meta = getAvifMetadata(fixture)
+    const payload = getItemPayload(fixture, boxes, meta.primaryItemId)!
+    const obus = parseOBUs(payload)
+    const seq = parseSequenceHeader(obus.find(o => o.type === OBUType.SEQUENCE_HEADER)!.data)
+    const frameOBU = obus.find(o => o.type === OBUType.FRAME)!
+    const { header, tiles } = parseFrameOBU(frameOBU.data, seq)
+
+    expect(header.frameType).toBe(0) // KEY_FRAME
+    expect(header.showFrame).toBe(true)
+    expect(header.frameWidth).toBe(512)
+    expect(header.frameHeight).toBe(384)
+    expect(header.miCols).toBe(128)
+    expect(header.miRows).toBe(96)
+    expect(header.allowIntrabc).toBe(false)
+    expect(header.quantization.baseQIdx).toBeGreaterThan(0)
+    expect(header.quantization.baseQIdx).toBeLessThan(256)
+    expect(header.codedLossless).toBe(false)
+    expect(header.segmentation.enabled).toBe(false)
+
+    expect(header.tileInfo.tileCols).toBe(1)
+    expect(header.tileInfo.tileRows).toBe(1)
+    expect(header.tileInfo.miColStarts).toEqual([0, 128])
+    expect(header.tileInfo.miRowStarts).toEqual([0, 96])
+
+    expect(tiles).toHaveLength(1)
+    // The single tile owns the whole remaining payload
+    expect(tiles[0].data.length).toBeGreaterThan(20000)
+    expect(tiles[0].data.length).toBeLessThan(frameOBU.data.length)
   })
 })

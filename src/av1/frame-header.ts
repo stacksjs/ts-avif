@@ -1,0 +1,713 @@
+/**
+ * AV1 uncompressed frame header parsing (spec 5.9), for the intra/still-image
+ * path. Inter frames are rejected with a clear error - AVIF stills are always
+ * KEY_FRAME or INTRA_ONLY_FRAME.
+ */
+import type { SequenceHeader } from './sequence'
+import { BitReader, clamp } from './bits'
+import { SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS } from './sequence'
+
+export const FrameType = {
+  KEY: 0,
+  INTER: 1,
+  INTRA_ONLY: 2,
+  SWITCH: 3,
+} as const
+
+const PRIMARY_REF_NONE = 7
+const MAX_TILE_WIDTH = 4096
+const MAX_TILE_AREA = 4096 * 2304
+const MAX_TILE_COLS = 64
+const MAX_TILE_ROWS = 64
+const MAX_SEGMENTS = 8
+export const SEG_LVL_ALT_Q = 0
+export const SEG_LVL_MAX = 8
+
+const SEGMENTATION_FEATURE_BITS = [8, 6, 6, 6, 6, 3, 0, 0]
+const SEGMENTATION_FEATURE_SIGNED = [1, 1, 1, 1, 1, 0, 0, 0]
+const SEGMENTATION_FEATURE_MAX = [255, 63, 63, 63, 63, 7, 0, 0]
+
+export const TxModes = {
+  ONLY_4X4: 0,
+  LARGEST: 1,
+  SELECT: 2,
+} as const
+
+export const RestorationType = {
+  NONE: 0,
+  WIENER: 1,
+  SGRPROJ: 2,
+  SWITCHABLE: 3,
+} as const
+
+export interface TileInfo {
+  tileColsLog2: number
+  tileRowsLog2: number
+  tileCols: number
+  tileRows: number
+  /** Mi column boundaries, length tileCols + 1. */
+  miColStarts: number[]
+  /** Mi row boundaries, length tileRows + 1. */
+  miRowStarts: number[]
+  contextUpdateTileId: number
+  tileSizeBytes: number
+}
+
+export interface QuantizationParams {
+  baseQIdx: number
+  deltaQYDc: number
+  deltaQUDc: number
+  deltaQUAc: number
+  deltaQVDc: number
+  deltaQVAc: number
+  usingQMatrix: boolean
+  qmY: number
+  qmU: number
+  qmV: number
+}
+
+export interface SegmentationParams {
+  enabled: boolean
+  updateMap: boolean
+  temporalUpdate: boolean
+  updateData: boolean
+  /** [segment][feature] */
+  featureEnabled: boolean[][]
+  featureData: number[][]
+  segIdPreSkip: boolean
+  lastActiveSegId: number
+}
+
+export interface LoopFilterParams {
+  levels: [number, number, number, number]
+  sharpness: number
+  deltaEnabled: boolean
+  refDeltas: number[]
+  modeDeltas: number[]
+}
+
+export interface CdefParams {
+  damping: number
+  bits: number
+  yPriStrength: number[]
+  ySecStrength: number[]
+  uvPriStrength: number[]
+  uvSecStrength: number[]
+}
+
+export interface LrParams {
+  /** Per-plane restoration type. */
+  frameRestorationType: number[]
+  usesLr: boolean
+  usesChromaLr: boolean
+  /** Loop restoration unit size per plane (in pixels). */
+  loopRestorationSize: number[]
+}
+
+export interface FrameHeader {
+  frameType: number
+  showFrame: boolean
+  showableFrame: boolean
+  errorResilientMode: boolean
+  disableCdfUpdate: boolean
+  allowScreenContentTools: boolean
+  forceIntegerMv: boolean
+  frameSizeOverride: boolean
+  orderHint: number
+  primaryRefFrame: number
+  refreshFrameFlags: number
+  frameWidth: number
+  frameHeight: number
+  upscaledWidth: number
+  superresDenom: number
+  renderWidth: number
+  renderHeight: number
+  miCols: number
+  miRows: number
+  allowIntrabc: boolean
+  disableFrameEndUpdateCdf: boolean
+  tileInfo: TileInfo
+  quantization: QuantizationParams
+  segmentation: SegmentationParams
+  deltaQPresent: boolean
+  deltaQRes: number
+  deltaLfPresent: boolean
+  deltaLfRes: number
+  deltaLfMulti: boolean
+  codedLossless: boolean
+  allLossless: boolean
+  /** Per-segment lossless flag. */
+  losslessArray: boolean[]
+  /** Per-segment effective base qindex. */
+  segQIndex: number[]
+  loopFilter: LoopFilterParams
+  cdef: CdefParams
+  lr: LrParams
+  txMode: number
+  reducedTxSet: boolean
+}
+
+function tileLog2(blkSize: number, target: number): number {
+  let k = 0
+  while ((blkSize << k) < target)
+    k++
+  return k
+}
+
+/** get_qindex for a segment at frame level (no delta-q lookup). */
+export function getQIndex(seg: SegmentationParams, baseQIdx: number, segmentId: number): number {
+  if (seg.enabled && seg.featureEnabled[segmentId][SEG_LVL_ALT_Q]) {
+    const data = seg.featureData[segmentId][SEG_LVL_ALT_Q]
+    return clamp(baseQIdx + data, 0, 255)
+  }
+  return baseQIdx
+}
+
+function readDeltaQ(r: BitReader): number {
+  return r.readBit() === 1 ? r.su(7) : 0
+}
+
+/**
+ * Parse the uncompressed header from `r`. The reader is left positioned just
+ * after the header bits (call `byteAlign()` before reading tile group data
+ * when parsing a FRAME OBU).
+ */
+export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader {
+  let frameType: number = FrameType.KEY
+  let showFrame = true
+  let showableFrame = false
+  let errorResilientMode = false
+
+  const idLen = seq.frameIdNumbersPresent
+    ? seq.additionalFrameIdLength + seq.deltaFrameIdLength
+    : 0
+
+  if (!seq.reducedStillPictureHeader) {
+    const showExistingFrame = r.readBit() === 1
+    if (showExistingFrame) {
+      throw new Error('ts-avif: show_existing_frame is not supported for still images')
+    }
+    frameType = r.readBits(2)
+    showFrame = r.readBit() === 1
+    if (showFrame && seq.decoderModelInfoPresent && !seq.equalPictureInterval)
+      r.readBits(seq.framePresentationTimeLength) // frame_presentation_time
+    if (showFrame)
+      showableFrame = frameType !== FrameType.KEY
+    else
+      showableFrame = r.readBit() === 1
+    if (frameType === FrameType.SWITCH || (frameType === FrameType.KEY && showFrame))
+      errorResilientMode = true
+    else
+      errorResilientMode = r.readBit() === 1
+  }
+
+  const frameIsIntra = frameType === FrameType.KEY || frameType === FrameType.INTRA_ONLY
+  if (!frameIsIntra)
+    throw new Error('ts-avif: inter frames are not supported (still images only)')
+
+  const disableCdfUpdate = r.readBit() === 1
+
+  const allowScreenContentTools = seq.seqForceScreenContentTools === SELECT_SCREEN_CONTENT_TOOLS
+    ? r.readBit() === 1
+    : seq.seqForceScreenContentTools === 1
+  if (allowScreenContentTools && seq.seqForceIntegerMv === SELECT_INTEGER_MV)
+    r.readBit() // force_integer_mv, always overridden to 1 for intra frames
+  const forceIntegerMv = true
+
+  if (seq.frameIdNumbersPresent)
+    r.readBits(idLen) // current_frame_id
+
+  let frameSizeOverride = false
+  if (frameType === FrameType.SWITCH)
+    frameSizeOverride = true
+  else if (!seq.reducedStillPictureHeader)
+    frameSizeOverride = r.readBit() === 1
+
+  const orderHint = r.readBits(seq.orderHintBits)
+  const primaryRefFrame = PRIMARY_REF_NONE // FrameIsIntra || error_resilient
+
+  if (seq.decoderModelInfoPresent) {
+    const bufferRemovalTimePresent = r.readBit() === 1
+    if (bufferRemovalTimePresent) {
+      for (const op of seq.operatingPoints) {
+        if (op.decoderModelPresent)
+          r.readBits(seq.bufferRemovalTimeLength) // buffer_removal_time
+      }
+    }
+  }
+
+  let refreshFrameFlags = 0xFF
+  if (!(frameType === FrameType.SWITCH || (frameType === FrameType.KEY && showFrame)))
+    refreshFrameFlags = r.readBits(8)
+
+  if (refreshFrameFlags !== 0xFF && errorResilientMode && seq.enableOrderHint) {
+    for (let i = 0; i < 8; i++)
+      r.readBits(seq.orderHintBits) // ref_order_hint
+  }
+
+  // frame_size() + render_size(), intra path
+  let frameWidth: number
+  let frameHeight: number
+  if (frameSizeOverride) {
+    frameWidth = r.readBits(seq.frameWidthBits) + 1
+    frameHeight = r.readBits(seq.frameHeightBits) + 1
+  }
+  else {
+    frameWidth = seq.maxFrameWidth
+    frameHeight = seq.maxFrameHeight
+  }
+
+  // superres_params()
+  let superresDenom = 8
+  if (seq.enableSuperres && r.readBit() === 1)
+    superresDenom = r.readBits(3) + 9
+  const upscaledWidth = frameWidth
+  frameWidth = Math.floor((upscaledWidth * 8 + Math.floor(superresDenom / 2)) / superresDenom)
+
+  // compute_image_size()
+  const miCols = 2 * ((frameWidth + 7) >> 3)
+  const miRows = 2 * ((frameHeight + 7) >> 3)
+
+  // render_size()
+  let renderWidth = upscaledWidth
+  let renderHeight = frameHeight
+  if (r.readBit() === 1) { // render_and_frame_size_different
+    renderWidth = r.readBits(16) + 1
+    renderHeight = r.readBits(16) + 1
+  }
+
+  let allowIntrabc = false
+  if (allowScreenContentTools && upscaledWidth === frameWidth)
+    allowIntrabc = r.readBit() === 1
+
+  const disableFrameEndUpdateCdf
+    = seq.reducedStillPictureHeader || disableCdfUpdate ? true : r.readBit() === 1
+
+  const tileInfo = parseTileInfo(r, seq, miCols, miRows)
+  const quantization = parseQuantizationParams(r, seq)
+  const segmentation = parseSegmentationParams(r)
+
+  // delta_q_params()
+  let deltaQPresent = false
+  let deltaQRes = 0
+  if (quantization.baseQIdx > 0)
+    deltaQPresent = r.readBit() === 1
+  if (deltaQPresent)
+    deltaQRes = r.readBits(2)
+
+  // delta_lf_params()
+  let deltaLfPresent = false
+  let deltaLfRes = 0
+  let deltaLfMulti = false
+  if (deltaQPresent) {
+    if (!allowIntrabc)
+      deltaLfPresent = r.readBit() === 1
+    if (deltaLfPresent) {
+      deltaLfRes = r.readBits(2)
+      deltaLfMulti = r.readBit() === 1
+    }
+  }
+
+  // Lossless derivation
+  const losslessArray: boolean[] = []
+  const segQIndex: number[] = []
+  let codedLossless = true
+  for (let segmentId = 0; segmentId < MAX_SEGMENTS; segmentId++) {
+    const qindex = getQIndex(segmentation, quantization.baseQIdx, segmentId)
+    segQIndex.push(qindex)
+    const lossless = qindex === 0
+      && quantization.deltaQYDc === 0
+      && quantization.deltaQUAc === 0 && quantization.deltaQUDc === 0
+      && quantization.deltaQVAc === 0 && quantization.deltaQVDc === 0
+    losslessArray.push(lossless)
+    if (!lossless)
+      codedLossless = false
+  }
+  const allLossless = codedLossless && frameWidth === upscaledWidth
+
+  const loopFilter = parseLoopFilterParams(r, seq, codedLossless, allowIntrabc)
+  const cdef = parseCdefParams(r, seq, codedLossless, allowIntrabc)
+  const lr = parseLrParams(r, seq, allLossless, allowIntrabc)
+
+  // read_tx_mode()
+  let txMode: number = TxModes.ONLY_4X4
+  if (!codedLossless)
+    txMode = r.readBit() === 1 ? TxModes.SELECT : TxModes.LARGEST
+
+  // frame_reference_mode(): intra -> reference_select = 0 (no bits)
+  // skip_mode_params(): SkipModeAllowed = 0 for intra -> no bits
+  // allow_warped_motion: FrameIsIntra -> 0 (no bits)
+
+  const reducedTxSet = r.readBit() === 1
+
+  // global_motion_params(): no bits for intra frames
+  // film_grain_params()
+  if (seq.filmGrainParamsPresent && (showFrame || showableFrame)) {
+    const applyGrain = r.readBit() === 1
+    if (applyGrain)
+      throw new Error('ts-avif: film grain synthesis is not supported yet')
+  }
+
+  return {
+    frameType,
+    showFrame,
+    showableFrame,
+    errorResilientMode,
+    disableCdfUpdate,
+    allowScreenContentTools,
+    forceIntegerMv,
+    frameSizeOverride,
+    orderHint,
+    primaryRefFrame,
+    refreshFrameFlags,
+    frameWidth,
+    frameHeight,
+    upscaledWidth,
+    superresDenom,
+    renderWidth,
+    renderHeight,
+    miCols,
+    miRows,
+    allowIntrabc,
+    disableFrameEndUpdateCdf,
+    tileInfo,
+    quantization,
+    segmentation,
+    deltaQPresent,
+    deltaQRes,
+    deltaLfPresent,
+    deltaLfRes,
+    deltaLfMulti,
+    codedLossless,
+    allLossless,
+    losslessArray,
+    segQIndex,
+    loopFilter,
+    cdef,
+    lr,
+    txMode,
+    reducedTxSet,
+  }
+}
+
+function parseTileInfo(r: BitReader, seq: SequenceHeader, miCols: number, miRows: number): TileInfo {
+  const sbCols = seq.use128x128Superblock ? ((miCols + 31) >> 5) : ((miCols + 15) >> 4)
+  const sbRows = seq.use128x128Superblock ? ((miRows + 31) >> 5) : ((miRows + 15) >> 4)
+  const sbShift = seq.use128x128Superblock ? 5 : 4
+  const sbSize = sbShift + 2
+  const maxTileWidthSb = MAX_TILE_WIDTH >> sbSize
+  let maxTileAreaSb = MAX_TILE_AREA >> (2 * sbSize)
+  const minLog2TileCols = tileLog2(maxTileWidthSb, sbCols)
+  const maxLog2TileCols = tileLog2(1, Math.min(sbCols, MAX_TILE_COLS))
+  const maxLog2TileRows = tileLog2(1, Math.min(sbRows, MAX_TILE_ROWS))
+  const minLog2Tiles = Math.max(minLog2TileCols, tileLog2(maxTileAreaSb, sbRows * sbCols))
+
+  let tileColsLog2: number
+  let tileRowsLog2: number
+  const miColStarts: number[] = []
+  const miRowStarts: number[] = []
+  let tileCols: number
+  let tileRows: number
+
+  const uniformTileSpacing = r.readBit() === 1
+  if (uniformTileSpacing) {
+    tileColsLog2 = minLog2TileCols
+    while (tileColsLog2 < maxLog2TileCols) {
+      if (r.readBit() === 1)
+        tileColsLog2++
+      else
+        break
+    }
+    const tileWidthSb = (sbCols + (1 << tileColsLog2) - 1) >> tileColsLog2
+    let i = 0
+    for (let startSb = 0; startSb < sbCols; startSb += tileWidthSb) {
+      miColStarts.push(startSb << sbShift)
+      i++
+    }
+    miColStarts.push(miCols)
+    tileCols = i
+
+    const minLog2TileRows = Math.max(minLog2Tiles - tileColsLog2, 0)
+    tileRowsLog2 = minLog2TileRows
+    while (tileRowsLog2 < maxLog2TileRows) {
+      if (r.readBit() === 1)
+        tileRowsLog2++
+      else
+        break
+    }
+    const tileHeightSb = (sbRows + (1 << tileRowsLog2) - 1) >> tileRowsLog2
+    i = 0
+    for (let startSb = 0; startSb < sbRows; startSb += tileHeightSb) {
+      miRowStarts.push(startSb << sbShift)
+      i++
+    }
+    miRowStarts.push(miRows)
+    tileRows = i
+  }
+  else {
+    let widestTileSb = 0
+    let startSb = 0
+    let i = 0
+    for (; startSb < sbCols; i++) {
+      miColStarts.push(startSb << sbShift)
+      const maxWidth = Math.min(sbCols - startSb, maxTileWidthSb)
+      const widthInSbs = r.ns(maxWidth) + 1
+      widestTileSb = Math.max(widthInSbs, widestTileSb)
+      startSb += widthInSbs
+    }
+    miColStarts.push(miCols)
+    tileCols = i
+    tileColsLog2 = tileLog2(1, tileCols)
+
+    if (minLog2Tiles > 0)
+      maxTileAreaSb = (sbRows * sbCols) >> (minLog2Tiles + 1)
+    else
+      maxTileAreaSb = sbRows * sbCols
+    const maxTileHeightSb = Math.max(Math.floor(maxTileAreaSb / widestTileSb), 1)
+
+    startSb = 0
+    i = 0
+    for (; startSb < sbRows; i++) {
+      miRowStarts.push(startSb << sbShift)
+      const maxHeight = Math.min(sbRows - startSb, maxTileHeightSb)
+      const heightInSbs = r.ns(maxHeight) + 1
+      startSb += heightInSbs
+    }
+    miRowStarts.push(miRows)
+    tileRows = i
+    tileRowsLog2 = tileLog2(1, tileRows)
+  }
+
+  let contextUpdateTileId = 0
+  let tileSizeBytes = 1
+  if (tileColsLog2 > 0 || tileRowsLog2 > 0) {
+    contextUpdateTileId = r.readBits(tileRowsLog2 + tileColsLog2)
+    tileSizeBytes = r.readBits(2) + 1
+  }
+
+  return {
+    tileColsLog2,
+    tileRowsLog2,
+    tileCols,
+    tileRows,
+    miColStarts,
+    miRowStarts,
+    contextUpdateTileId,
+    tileSizeBytes,
+  }
+}
+
+function parseQuantizationParams(r: BitReader, seq: SequenceHeader): QuantizationParams {
+  const baseQIdx = r.readBits(8)
+  const deltaQYDc = readDeltaQ(r)
+  let deltaQUDc = 0
+  let deltaQUAc = 0
+  let deltaQVDc = 0
+  let deltaQVAc = 0
+  if (seq.numPlanes > 1) {
+    const diffUvDelta = seq.separateUvDeltaQ ? r.readBit() === 1 : false
+    deltaQUDc = readDeltaQ(r)
+    deltaQUAc = readDeltaQ(r)
+    if (diffUvDelta) {
+      deltaQVDc = readDeltaQ(r)
+      deltaQVAc = readDeltaQ(r)
+    }
+    else {
+      deltaQVDc = deltaQUDc
+      deltaQVAc = deltaQUAc
+    }
+  }
+  const usingQMatrix = r.readBit() === 1
+  let qmY = 0
+  let qmU = 0
+  let qmV = 0
+  if (usingQMatrix) {
+    qmY = r.readBits(4)
+    qmU = r.readBits(4)
+    qmV = !seq.separateUvDeltaQ ? qmU : r.readBits(4)
+  }
+  return { baseQIdx, deltaQYDc, deltaQUDc, deltaQUAc, deltaQVDc, deltaQVAc, usingQMatrix, qmY, qmU, qmV }
+}
+
+function parseSegmentationParams(r: BitReader): SegmentationParams {
+  const featureEnabled: boolean[][] = []
+  const featureData: number[][] = []
+  for (let i = 0; i < MAX_SEGMENTS; i++) {
+    featureEnabled.push(Array.from({ length: SEG_LVL_MAX }, () => false))
+    featureData.push(Array.from({ length: SEG_LVL_MAX }, () => 0))
+  }
+
+  const enabled = r.readBit() === 1
+  // Intra key frames always have primary_ref_frame == PRIMARY_REF_NONE:
+  // segmentation_update_map = 1, temporal_update = 0, update_data = 1.
+  const updateMap = enabled
+  const temporalUpdate = false
+  const updateData = enabled
+
+  if (enabled) {
+    for (let i = 0; i < MAX_SEGMENTS; i++) {
+      for (let j = 0; j < SEG_LVL_MAX; j++) {
+        if (r.readBit() === 1) { // feature_enabled
+          featureEnabled[i][j] = true
+          const bitsToRead = SEGMENTATION_FEATURE_BITS[j]
+          const limit = SEGMENTATION_FEATURE_MAX[j]
+          if (SEGMENTATION_FEATURE_SIGNED[j] === 1)
+            featureData[i][j] = clamp(r.su(1 + bitsToRead), -limit, limit)
+          else
+            featureData[i][j] = clamp(bitsToRead > 0 ? r.readBits(bitsToRead) : 0, 0, limit)
+        }
+      }
+    }
+  }
+
+  let segIdPreSkip = false
+  let lastActiveSegId = 0
+  for (let i = 0; i < MAX_SEGMENTS; i++) {
+    for (let j = 0; j < SEG_LVL_MAX; j++) {
+      if (featureEnabled[i][j]) {
+        lastActiveSegId = i
+        if (j >= 5) // SEG_LVL_REF_FRAME
+          segIdPreSkip = true
+      }
+    }
+  }
+
+  return { enabled, updateMap, temporalUpdate, updateData, featureEnabled, featureData, segIdPreSkip, lastActiveSegId }
+}
+
+function parseLoopFilterParams(
+  r: BitReader,
+  seq: SequenceHeader,
+  codedLossless: boolean,
+  allowIntrabc: boolean,
+): LoopFilterParams {
+  if (codedLossless || allowIntrabc) {
+    return {
+      levels: [0, 0, 0, 0],
+      sharpness: 0,
+      deltaEnabled: false,
+      refDeltas: [1, 0, 0, 0, -1, 0, -1, -1],
+      modeDeltas: [0, 0],
+    }
+  }
+
+  const levels: [number, number, number, number] = [r.readBits(6), r.readBits(6), 0, 0]
+  if (seq.numPlanes > 1 && (levels[0] !== 0 || levels[1] !== 0)) {
+    levels[2] = r.readBits(6)
+    levels[3] = r.readBits(6)
+  }
+  const sharpness = r.readBits(3)
+  const refDeltas = [1, 0, 0, 0, -1, 0, -1, -1]
+  const modeDeltas = [0, 0]
+  const deltaEnabled = r.readBit() === 1
+  if (deltaEnabled && r.readBit() === 1) { // loop_filter_delta_update
+    for (let i = 0; i < 8; i++) {
+      if (r.readBit() === 1)
+        refDeltas[i] = r.su(7)
+    }
+    for (let i = 0; i < 2; i++) {
+      if (r.readBit() === 1)
+        modeDeltas[i] = r.su(7)
+    }
+  }
+  return { levels, sharpness, deltaEnabled, refDeltas, modeDeltas }
+}
+
+function parseCdefParams(
+  r: BitReader,
+  seq: SequenceHeader,
+  codedLossless: boolean,
+  allowIntrabc: boolean,
+): CdefParams {
+  if (codedLossless || allowIntrabc || !seq.enableCdef) {
+    return {
+      damping: 3,
+      bits: 0,
+      yPriStrength: [0],
+      ySecStrength: [0],
+      uvPriStrength: [0],
+      uvSecStrength: [0],
+    }
+  }
+
+  const damping = r.readBits(2) + 3
+  const bits = r.readBits(2)
+  const n = 1 << bits
+  const yPriStrength: number[] = []
+  const ySecStrength: number[] = []
+  const uvPriStrength: number[] = []
+  const uvSecStrength: number[] = []
+  for (let i = 0; i < n; i++) {
+    yPriStrength.push(r.readBits(4))
+    let sec = r.readBits(2)
+    if (sec === 3)
+      sec += 1
+    ySecStrength.push(sec)
+    if (seq.numPlanes > 1) {
+      uvPriStrength.push(r.readBits(4))
+      sec = r.readBits(2)
+      if (sec === 3)
+        sec += 1
+      uvSecStrength.push(sec)
+    }
+    else {
+      uvPriStrength.push(0)
+      uvSecStrength.push(0)
+    }
+  }
+  return { damping, bits, yPriStrength, ySecStrength, uvPriStrength, uvSecStrength }
+}
+
+function parseLrParams(
+  r: BitReader,
+  seq: SequenceHeader,
+  allLossless: boolean,
+  allowIntrabc: boolean,
+): LrParams {
+  if (allLossless || allowIntrabc || !seq.enableRestoration) {
+    return {
+      frameRestorationType: [RestorationType.NONE, RestorationType.NONE, RestorationType.NONE],
+      usesLr: false,
+      usesChromaLr: false,
+      loopRestorationSize: [256, 256, 256],
+    }
+  }
+
+  const remapLrType = [
+    RestorationType.NONE,
+    RestorationType.SWITCHABLE,
+    RestorationType.WIENER,
+    RestorationType.SGRPROJ,
+  ]
+  const frameRestorationType: number[] = []
+  let usesLr = false
+  let usesChromaLr = false
+  for (let i = 0; i < seq.numPlanes; i++) {
+    const lrType = r.readBits(2)
+    frameRestorationType.push(remapLrType[lrType])
+    if (frameRestorationType[i] !== RestorationType.NONE) {
+      usesLr = true
+      if (i > 0)
+        usesChromaLr = true
+    }
+  }
+
+  let loopRestorationSize: number[] = [256, 256, 256]
+  if (usesLr) {
+    let lrUnitShift = 0
+    if (seq.use128x128Superblock) {
+      lrUnitShift = r.readBit() + 1
+    }
+    else {
+      lrUnitShift = r.readBit()
+      if (lrUnitShift)
+        lrUnitShift += r.readBit()
+    }
+    const size0 = 256 >> (2 - lrUnitShift)
+    let lrUvShift = 0
+    if (seq.subsamplingX === 1 && seq.subsamplingY === 1 && usesChromaLr)
+      lrUvShift = r.readBit()
+    loopRestorationSize = [size0, size0 >> lrUvShift, size0 >> lrUvShift]
+  }
+  return { frameRestorationType, usesLr, usesChromaLr, loopRestorationSize }
+}
