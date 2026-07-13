@@ -185,30 +185,18 @@ function parseSequenceHeader(data: Uint8Array): SequenceHeader {
 
 function decodeFrame(data: Uint8Array, seqHeader: SequenceHeader): Uint8Array {
   const { maxFrameWidth: width, maxFrameHeight: height } = seqHeader
-  const numPixels = width * height
 
-  // For a complete implementation, this would:
-  // 1. Parse frame header from data
-  // 2. Decode tiles
-  // 3. Apply transforms (DCT, ADST, identity)
-  // 4. Apply intra prediction
-  // 5. Apply loop filtering
-  // 6. Apply CDEF (Constrained Directional Enhancement Filter)
-  // 7. Apply loop restoration
-  // 8. Convert YUV to RGB
-  void data
-
-  // For now, return a gray placeholder
-  const rgba = new Uint8Array(numPixels * 4)
-
-  for (let i = 0; i < numPixels; i++) {
-    rgba[i * 4] = 128
-    rgba[i * 4 + 1] = 128
-    rgba[i * 4 + 2] = 128
-    rgba[i * 4 + 3] = 255
-  }
-
-  return rgba
+  // The AV1 entropy decoder (frame header, tile decode, transforms, intra
+  // prediction, loop filters, CDEF, loop restoration, YUV→RGB) is not
+  // implemented yet. Failing loudly beats the old behavior of silently
+  // returning a gray placeholder that looked like a successful decode.
+  throw new Error(
+    `ts-avif: AV1 frame decoding is not implemented yet `
+    + `(${width}x${height}, ${data.length} byte frame OBU parsed). `
+    + `Container, OBU, and sequence-header layers are complete — the entropy `
+    + `decoder is the remaining work. Use getAvifMetadata() for everything `
+    + `knowable without decoding pixels.`,
+  )
 }
 
 /**

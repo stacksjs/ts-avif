@@ -1,4 +1,6 @@
-export { decode } from './decoder'
+export { decode, getAvifMetadata } from './decoder'
+export type { AvifGridInfo, AvifItemInfo } from './container/avif'
+export { getAvifItemInfo, getItemPayload, parseGridBody, parseIpma, parseIref, parsePitm } from './container/avif'
 export { encode, encodeAsync } from './encoder'
 export { encodeViaAvifenc, hasAvifenc } from './encoder-cli'
 export { optimize, optimizeWithStats, remux } from './optimize'

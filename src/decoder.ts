@@ -1,13 +1,29 @@
 import type { AvifDecodeOptions, AvifImageData } from './types'
+import type { AvifItemInfo } from './container/avif'
 import { decodeAV1 } from './av1/decoder'
+import { getAvifItemInfo, getItemPayload } from './container/avif'
 import {
   findBox,
   getAvifInfo,
-  getImageData,
   parseISOBMFF,
   parseIinf,
   validateFtyp,
 } from './container/heif'
+
+
+/**
+ * Parse everything knowable without entropy-decoding pixels: dimensions,
+ * grid layout, rotation/mirror, bit depth, and the av1C configuration.
+ * Property lookups are per-item (ipma-based), so grid images report the
+ * full output size instead of a tile's.
+ */
+export function getAvifMetadata(buffer: Uint8Array | ArrayBuffer): AvifItemInfo {
+  const data = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer
+  if (!validateFtyp(data))
+    throw new Error('ts-avif: not a valid AVIF/HEIF file')
+  const boxes = parseISOBMFF(data)
+  return getAvifItemInfo(data, boxes)
+}
 
 /**
  * Decode an AVIF image buffer to RGBA pixel data
@@ -36,7 +52,7 @@ export function decode(
   }
 
   // Get image data for primary item
-  const av1Data = getImageData(data, boxes, primaryItemId)
+  const av1Data = getItemPayload(data, boxes, primaryItemId)
   if (!av1Data) {
     throw new Error('Could not locate image data')
   }
@@ -48,7 +64,7 @@ export function decode(
   if (info.hasAlpha && !options.ignoreAlpha) {
     const alphaItemId = getAlphaItemId(boxes)
     if (alphaItemId !== null) {
-      const alphaData = getImageData(data, boxes, alphaItemId)
+      const alphaData = getItemPayload(data, boxes, alphaItemId)
       if (alphaData) {
         const alphaImage = decodeAV1(alphaData)
         applyAlphaChannel(imageData, alphaImage)
