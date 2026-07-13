@@ -1511,54 +1511,9 @@ export class TileDecoder {
 
     b.yMode = IntraPredMode.DC_PRED
     b.uvMode = IntraPredMode.DC_PRED
-    if (this.hdr.losslessArray[b.segId]) {
-      b.tx = TxfmSize.TX_4X4
-      b.uvtx = TxfmSize.TX_4X4
-    }
-    else {
-      b.tx = MAX_TXFM_SIZE_FOR_BS[bs * 4]
-      b.uvtx = MAX_TXFM_SIZE_FOR_BS[bs * 4 + this.layout]
-      if (!b.skip && this.hdr.txMode === 2)
-        throw new Error('ts-avif: variable transform trees for lossy intrabc are not implemented')
-    }
-
-    this.reconBIntra(bs, b, w4, h4, cbw4, cbh4, hasChroma, 0)
-
-    const tDim = TXFM_INFO[b.tx]
-    for (let i = 0; i < bw4; i++) {
-      const o = bx4 + i
-      this.a.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 2]
-      this.a.tx[o] = tDim.lw
-      this.a.mode[o] = IntraPredMode.DC_PRED
-      this.a.palSz[o] = 0
-      this.a.palSzUv[o] = 0
-      this.a.segPred[o] = 0
-      this.a.skipMode[o] = 0
-      this.a.intra[o] = 0
-      this.a.skip[o] = b.skip
-      this.a.mvX[o] = b.mvX
-      this.a.mvY[o] = b.mvY
-    }
-    for (let i = 0; i < bh4; i++) {
-      const o = by4 + i
-      this.l.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 3]
-      this.l.tx[o] = tDim.lh
-      this.l.mode[o] = IntraPredMode.DC_PRED
-      this.l.palSz[o] = 0
-      this.l.palSzUv[o] = 0
-      this.l.segPred[o] = 0
-      this.l.skipMode[o] = 0
-      this.l.intra[o] = 0
-      this.l.skip[o] = b.skip
-      this.l.mvX[o] = b.mvX
-      this.l.mvY[o] = b.mvY
-    }
-    if (hasChroma) {
-      const cbx4 = bx4 >> this.ssHor
-      const cby4 = by4 >> this.ssVer
-      this.a.uvmode.fill(IntraPredMode.DC_PRED, cbx4, cbx4 + cbw4)
-      this.l.uvmode.fill(IntraPredMode.DC_PRED, cby4, cby4 + cbh4)
-    }
+    this.readVarTxTree(bs, b, bw4, bh4, bx4, by4)
+    this.reconBInter(bs, b, w4, h4, cbw4, cbh4, hasChroma)
+    this.updateInterContexts(bs, b, bw4, bh4, cbw4, cbh4, hasChroma, bx4, by4)
   }
 
   private readMvResidual(b: Av1Block, precision = -1): void {
