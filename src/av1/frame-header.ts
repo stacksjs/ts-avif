@@ -122,6 +122,13 @@ export interface FilmGrainParams {
   clipToRestrictedRange: boolean
 }
 
+export interface GlobalMotionParams {
+  /** 0 identity, 1 translation, 2 rotzoom, 3 affine. */
+  type: number
+  /** AV1 warped-model parameters at 16-bit model precision. */
+  matrix: [number, number, number, number, number, number]
+}
+
 export interface FrameHeader {
   showExistingFrame: boolean
   existingFrameIdx: number
@@ -175,6 +182,7 @@ export interface FrameHeader {
   skipModePresent: boolean
   skipModeRefs: [number, number]
   allowWarpedMotion: boolean
+  globalMotion: GlobalMotionParams[]
 }
 
 export interface FrameHeaderState {
@@ -289,10 +297,13 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader, state?: Fram
   const refFrameIdx: number[] = []
   if (!frameIsIntra) {
     const shortSignaling = seq.enableOrderHint && r.readBit() === 1
-    if (shortSignaling)
-      throw new Error('ts-avif: short inter reference signaling is not implemented')
+    if (shortSignaling) {
+      const lastFrameIdx = r.readBits(3)
+      const goldFrameIdx = r.readBits(3)
+      refFrameIdx.push(...setFrameRefs(state, orderHint, seq.orderHintBits, lastFrameIdx, goldFrameIdx))
+    }
     for (let i = 0; i < 7; i++) {
-      refFrameIdx.push(r.readBits(3))
+      if (!shortSignaling) refFrameIdx.push(r.readBits(3))
       if (seq.frameIdNumbersPresent) r.readBits(seq.deltaFrameIdLength)
       if (!state?.refs[refFrameIdx[i]])
         throw new Error(`ts-avif: inter frame references unavailable slot ${refFrameIdx[i]}`)
@@ -444,13 +455,20 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader, state?: Fram
 
   const reducedTxSet = r.readBit() === 1
 
-  // Identity global motion is by far the common case. Non-identity models
-  // are rejected before their parameter payload can be misinterpreted.
+  const identityMotion = (): GlobalMotionParams => ({
+    type: 0,
+    matrix: [0, 0, 65536, 0, 0, 65536],
+  })
+  const primaryHeader = primaryRefFrame < 7
+    ? state?.refs[refFrameIdx[primaryRefFrame]]
+    : null
+  const globalMotion: GlobalMotionParams[] = []
   if (!frameIsIntra) {
-    for (let ref = 0; ref < 7; ref++) {
-      if (r.readBit() === 1)
-        throw new Error('ts-avif: non-identity global motion is not implemented')
-    }
+    for (let ref = 0; ref < 7; ref++)
+      globalMotion.push(readGlobalMotion(r, primaryHeader?.globalMotion[ref] ?? identityMotion(), allowHighPrecisionMv))
+  }
+  else {
+    for (let ref = 0; ref < 7; ref++) globalMotion.push(identityMotion())
   }
   // film_grain_params(); intra frames always carry a fresh parameter set.
   let filmGrain: FilmGrainParams | null = null
@@ -563,6 +581,7 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader, state?: Fram
     skipModePresent,
     skipModeRefs,
     allowWarpedMotion,
+    globalMotion,
   }
 }
 
@@ -571,6 +590,115 @@ function relativeDistance(a: number, b: number, bits: number): number {
   const modulus = 1 << bits
   const diff = (a - b) & (modulus - 1)
   return diff & (modulus >> 1) ? diff - modulus : diff
+}
+
+function setFrameRefs(
+  state: FrameHeaderState | undefined,
+  orderHint: number,
+  orderHintBits: number,
+  lastFrameIdx: number,
+  goldFrameIdx: number,
+): number[] {
+  if (!state) throw new Error('ts-avif: short reference signaling requires reference state')
+  const center = 1 << (orderHintBits - 1)
+  const info = state.refs.map((header, mapIdx) => ({
+    mapIdx,
+    sortIdx: header ? center + relativeDistance(header.orderHint, orderHint, orderHintBits) : -1,
+  })).sort((a, b) => a.sortIdx - b.sortIdx || a.mapIdx - b.mapIdx)
+  const refs = new Array<number>(7).fill(-1)
+  const used = new Array<boolean>(7).fill(false)
+  const fwdStart = info.findIndex(item => item.sortIdx >= 0)
+  if (fwdStart < 0) throw new Error('ts-avif: short reference signaling has no valid references')
+  let fwdEnd = info.findIndex(item => item.sortIdx >= center) - 1
+  if (fwdEnd < fwdStart - 1) fwdEnd = info.length - 1
+  let bwdStart = fwdEnd + 1
+  let bwdEnd = info.length - 1
+
+  const assign = (type: number, item: { mapIdx: number }): void => {
+    refs[type] = item.mapIdx
+    used[type] = true
+  }
+  if (bwdStart <= bwdEnd) assign(6, info[bwdEnd--])
+  if (bwdStart <= bwdEnd) assign(4, info[bwdStart++])
+  if (bwdStart <= bwdEnd) assign(5, info[bwdStart])
+
+  for (let i = fwdStart; i <= fwdEnd; i++) {
+    if (info[i].mapIdx === lastFrameIdx) assign(0, info[i])
+    if (info[i].mapIdx === goldFrameIdx) assign(3, info[i])
+  }
+  if (!used[0] || !used[3])
+    throw new Error('ts-avif: short reference signaling names a non-forward LAST or GOLDEN frame')
+
+  const fillTypes = [1, 2, 4, 5, 6]
+  let fill = 0
+  for (; fill < fillTypes.length; fill++) {
+    const type = fillTypes[fill]
+    if (used[type]) continue
+    while (fwdStart <= fwdEnd && (info[fwdEnd].mapIdx === lastFrameIdx || info[fwdEnd].mapIdx === goldFrameIdx))
+      fwdEnd--
+    if (fwdStart > fwdEnd) break
+    assign(type, info[fwdEnd--])
+  }
+  for (; fill < fillTypes.length; fill++) {
+    const type = fillTypes[fill]
+    if (!used[type]) assign(type, info[fwdStart])
+  }
+  return refs
+}
+
+function readGlobalMotion(r: BitReader, previous: GlobalMotionParams, allowHighPrecisionMv: boolean): GlobalMotionParams {
+  let type = r.readBit()
+  if (type) type = r.readBit() ? 2 : r.readBit() ? 1 : 3
+  const matrix: GlobalMotionParams['matrix'] = [0, 0, 65536, 0, 0, 65536]
+  const prev = previous.matrix
+  if (type >= 2) {
+    matrix[2] = readSignedSubexpWithRef(r, 4097, 3, (prev[2] >> 1) - 32768) * 2 + 65536
+    matrix[3] = readSignedSubexpWithRef(r, 4097, 3, prev[3] >> 1) * 2
+  }
+  if (type === 3) {
+    matrix[4] = readSignedSubexpWithRef(r, 4097, 3, prev[4] >> 1) * 2
+    matrix[5] = readSignedSubexpWithRef(r, 4097, 3, (prev[5] >> 1) - 32768) * 2 + 65536
+  }
+  else if (type === 2) {
+    matrix[4] = -matrix[3]
+    matrix[5] = matrix[2]
+  }
+  if (type >= 1) {
+    const translationOnly = type === 1
+    const bits = translationOnly ? 9 - (allowHighPrecisionMv ? 0 : 1) : 12
+    const precision = translationOnly ? 13 + (allowHighPrecisionMv ? 0 : 1) : 10
+    matrix[0] = readSignedSubexpWithRef(r, (1 << bits) + 1, 3, prev[0] >> precision) * (1 << precision)
+    matrix[1] = readSignedSubexpWithRef(r, (1 << bits) + 1, 3, prev[1] >> precision) * (1 << precision)
+  }
+  return { type, matrix }
+}
+
+function readSignedSubexpWithRef(r: BitReader, n: number, k: number, ref: number): number {
+  const scaledN = n * 2 - 1
+  return inverseRecenterFinite(scaledN, ref + n - 1, readSubexp(r, scaledN, k)) - n + 1
+}
+
+function readSubexp(r: BitReader, n: number, k: number): number {
+  let i = 0
+  let mk = 0
+  while (true) {
+    const b = i ? k + i - 1 : k
+    const a = 1 << b
+    if (n <= mk + 3 * a) return r.ns(n - mk) + mk
+    if (!r.readBit()) return r.readBits(b) + mk
+    i++
+    mk += a
+  }
+}
+
+function inverseRecenterFinite(n: number, ref: number, value: number): number {
+  if (ref * 2 <= n) return inverseRecenter(ref, value)
+  return n - 1 - inverseRecenter(n - 1 - ref, value)
+}
+
+function inverseRecenter(ref: number, value: number): number {
+  if (value > ref * 2) return value
+  return value & 1 ? ref - ((value + 1) >> 1) : ref + (value >> 1)
 }
 
 function readGrainPoints(r: BitReader, maxPoints: number): [number, number][] {

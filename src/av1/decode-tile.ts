@@ -9,7 +9,7 @@
  * exact bitstream consumption alone.
  */
 import type { CdfContext } from './cdf'
-import type { FrameHeader } from './frame-header'
+import type { FrameHeader, GlobalMotionParams } from './frame-header'
 import type { EdgeNode } from './intra-edge'
 import type { SequenceHeader } from './sequence'
 import { clamp, floorLog2 } from './bits'
@@ -127,6 +127,8 @@ export interface Av1Block {
   txSplit1: number
   filterH: number
   filterV: number
+  globalMotion: GlobalMotionParams | null
+  globalMv: number
   tx: number
   uvtx: number
 }
@@ -274,6 +276,7 @@ export class TileDecoder {
   interMvX = new Int16Array(0)
   interMvY = new Int16Array(0)
   interNewMv = new Uint8Array(0)
+  interGlobalMv = new Uint8Array(0)
   interBs = new Uint8Array(0)
   txtpMap = new Uint8Array(32 * 32)
 
@@ -326,6 +329,7 @@ export class TileDecoder {
     this.interMvX = new Int16Array(n4)
     this.interMvY = new Int16Array(n4)
     this.interNewMv = new Uint8Array(n4)
+    this.interGlobalMv = new Uint8Array(n4)
     this.interBs = new Uint8Array(n4)
 
     if (hdr.segmentation.enabled)
@@ -574,6 +578,8 @@ export class TileDecoder {
       txSplit1: 0,
       filterH: hdr.interpolationFilter,
       filterV: hdr.interpolationFilter,
+      globalMotion: null,
+      globalMv: 0,
       tx: TxfmSize.TX_4X4,
       uvtx: TxfmSize.TX_4X4,
     }
@@ -975,8 +981,13 @@ export class TileDecoder {
     const newMvMode = this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('newmv_mode', modeContext & 7))
     if (newMvMode) {
       if (!this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('globalmv_mode', (modeContext >> 3) & 1))) {
-        b.mvX = b.mvY = 0
-        useSubpelFilter = Math.min(bw4, bh4) === 1
+        const motion = this.hdr.globalMotion[b.ref0]
+        b.globalMv = 1
+        const mv = this.globalMotionVector(motion, bx4, by4, bw4, bh4)
+        b.mvX = mv.x
+        b.mvY = mv.y
+        if (motion.type > 1 && Math.min(bw4, bh4) > 1) b.globalMotion = motion
+        useSubpelFilter = Math.min(bw4, bh4) === 1 || motion.type === 1
       }
       else if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('refmv_mode', (modeContext >> 4) & 15))) {
         candidateIndex = 1
@@ -1042,7 +1053,6 @@ export class TileDecoder {
         b.filterH = b.filterV = 0
       }
     }
-
     b.yMode = IntraPredMode.DC_PRED
     b.uvMode = IntraPredMode.DC_PRED
     this.readVarTxTree(bs, b, bw4, bh4, bx4, by4)
@@ -1142,6 +1152,7 @@ export class TileDecoder {
     haveLeft: boolean,
   ): { stack: Array<{ x: number, y: number, weight: number }>, count: number, context: number } {
     const stack: Array<{ x: number, y: number, weight: number }> = []
+    const global = this.globalMotionVector(this.hdr.globalMotion[ref], bx4, by4, bw4, bh4)
     const w4 = Math.min(bw4, 16, this.colEnd - bx4)
     const h4 = Math.min(bh4, 16, this.rowEnd - by4)
     let haveNewMv = 0
@@ -1154,8 +1165,8 @@ export class TileDecoder {
       if (row) rowMatch = 1
       else colMatch = 1
       if (nearest) haveNewMv |= this.interNewMv[off]
-      const mvX = this.interMvX[off]
-      const mvY = this.interMvY[off]
+      const mvX = this.interGlobalMv[off] ? global.x : this.interMvX[off]
+      const mvY = this.interGlobalMv[off] ? global.y : this.interMvY[off]
       const existing = stack.find(candidate => candidate.x === mvX && candidate.y === mvY)
       if (existing) existing.weight += weight
       else stack.push({ x: mvX, y: mvY, weight })
@@ -1240,7 +1251,7 @@ export class TileDecoder {
     const secondary = stack.slice(nearestCount).sort((a, c) => c.weight - a.weight)
     stack.splice(0, stack.length, ...nearest, ...secondary)
     const count = stack.length
-    while (stack.length < 2) stack.push({ x: 0, y: 0, weight: 2 })
+    while (stack.length < 2) stack.push({ x: global.x, y: global.y, weight: 2 })
     const globalMvContext = this.hdr.useRefFrameMvs ? 1 : 0
     return {
       stack,
@@ -1264,6 +1275,37 @@ export class TileDecoder {
       b.mvX = (b.mvX - (b.mvX >> 15)) & ~1
       b.mvY = (b.mvY - (b.mvY >> 15)) & ~1
     }
+  }
+
+  private globalMotionVector(
+    motion: GlobalMotionParams,
+    bx4: number,
+    by4: number,
+    bw4: number,
+    bh4: number,
+  ): { x: number, y: number } {
+    if (motion.type === 0) return { x: 0, y: 0 }
+    if (motion.type === 1) {
+      return {
+        x: motion.matrix[1] >> 13,
+        y: motion.matrix[0] >> 13,
+      }
+    }
+    const x = bx4 * 4 + bw4 * 2 - 1
+    const y = by4 * 4 + bh4 * 2 - 1
+    const xc = (motion.matrix[2] - 65536) * x + motion.matrix[3] * y + motion.matrix[0]
+    const yc = (motion.matrix[5] - 65536) * y + motion.matrix[4] * x + motion.matrix[1]
+    const shift = 16 - (3 - (this.hdr.allowHighPrecisionMv ? 0 : 1))
+    const round = (value: number): number => {
+      const magnitude = Math.floor((Math.abs(value) + 2 ** (shift - 1)) / 2 ** shift)
+      return (value < 0 ? -magnitude : magnitude) << (this.hdr.allowHighPrecisionMv ? 0 : 1)
+    }
+    const mv = { x: round(xc), y: round(yc) }
+    if (this.hdr.forceIntegerMv) {
+      mv.x = (mv.x - (mv.x >> 15) + 3) & ~7
+      mv.y = (mv.y - (mv.y >> 15) + 3) & ~7
+    }
+    return mv
   }
 
   private updateInterContexts(
@@ -1323,6 +1365,7 @@ export class TileDecoder {
       this.interMvX.fill(b.mvX, off, off + width)
       this.interMvY.fill(b.mvY, off, off + width)
       this.interNewMv.fill(b.newMv, off, off + width)
+      this.interGlobalMv.fill(b.globalMv, off, off + width)
       this.interBs.fill(bs, off, off + width)
     }
   }

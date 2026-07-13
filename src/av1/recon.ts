@@ -18,7 +18,7 @@ import {
   prepareIntraEdges,
 } from './ipred'
 import { itxfmAdd } from './itx'
-import { motionCompensate } from './mc'
+import { motionCompensate, warpAffine } from './mc'
 import { createPixelPlane } from './pixels'
 import { BLOCK_DIMENSIONS } from './tables'
 
@@ -203,6 +203,25 @@ export class PixelReconstructor {
       const srcStride2 = second?.stride(plane) ?? 0
       const phaseX = (b.mvX & (ssHor ? 15 : 7)) << (ssHor ? 0 : 1)
       const phaseY = (b.mvY & (ssVer ? 15 : 7)) << (ssVer ? 0 : 1)
+      if (b.globalMotion && !src2) {
+        warpAffine(
+          dst,
+          dstStride,
+          dstX,
+          dstY,
+          src,
+          srcStride,
+          plane ? first.uvStride : first.yStride,
+          Math.floor(src.length / srcStride),
+          width,
+          height,
+          ssHor,
+          ssVer,
+          b.globalMotion,
+          this.seq.bitDepth,
+        )
+        continue
+      }
       if (!src2) {
         motionCompensate(
           dst,
