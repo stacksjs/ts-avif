@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'bun:test'
 import { getAvifMetadata, getItemPayload, parseISOBMFF } from '../src'
-import { BitReader, ceilLog2, floorLog2 } from '../src/av1/bits'
+import { BitReader, BitWriter, ceilLog2, floorLog2 } from '../src/av1/bits'
+import { encodeSequenceHeader } from '../src/av1/encode-headers'
 import { parseOBUs } from '../src/av1/obu'
 import { parseSequenceHeader } from '../src/av1/sequence'
 import { parseFrameOBU } from '../src/av1/tile-group'
@@ -65,6 +66,42 @@ describe('BitReader', () => {
     expect(ceilLog2(3)).toBe(2)
     expect(ceilLog2(64)).toBe(6)
     expect(ceilLog2(65)).toBe(7)
+  })
+})
+
+describe('BitWriter', () => {
+  it('round-trips fixed, signed, and non-symmetric values', () => {
+    const w = new BitWriter()
+    w.writeBit(1)
+    w.writeBits(0b011, 3)
+    w.su(-6, 4)
+    for (let i = 0; i < 5; i++)
+      w.ns(i, 5)
+    w.byteAlign()
+
+    const r = new BitReader(w.finish())
+    expect(r.readBit()).toBe(1)
+    expect(r.readBits(3)).toBe(0b011)
+    expect(r.su(4)).toBe(-6)
+    for (let i = 0; i < 5; i++)
+      expect(r.ns(5)).toBe(i)
+  })
+})
+
+describe('encodeSequenceHeader', () => {
+  it('round-trips the pure encoder profile and dimensions', () => {
+    for (const [width, height] of [[1, 1], [17, 9], [512, 384], [65536, 65536]]) {
+      const seq = parseSequenceHeader(encodeSequenceHeader(width, height))
+      expect(seq.maxFrameWidth).toBe(width)
+      expect(seq.maxFrameHeight).toBe(height)
+      expect(seq.seqProfile).toBe(0)
+      expect(seq.stillPicture).toBe(true)
+      expect(seq.reducedStillPictureHeader).toBe(true)
+      expect(seq.bitDepth).toBe(8)
+      expect(seq.subsamplingX).toBe(1)
+      expect(seq.subsamplingY).toBe(1)
+      expect(seq.colorRange).toBe(true)
+    }
   })
 })
 

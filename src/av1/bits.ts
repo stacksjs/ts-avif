@@ -92,6 +92,80 @@ export class BitReader {
   }
 }
 
+/** MSB-first writer for AV1 uncompressed headers. */
+export class BitWriter {
+  private bytes: number[] = []
+  private current = 0
+  private used = 0
+
+  get bitPosition(): number {
+    return this.bytes.length * 8 + this.used
+  }
+
+  writeBit(bit: number | boolean): void {
+    const value = typeof bit === 'boolean' ? Number(bit) : bit
+    if (value !== 0 && value !== 1)
+      throw new RangeError(`BitWriter: bit must be 0 or 1, got ${value}`)
+    this.current |= value << (7 - this.used)
+    this.used++
+    if (this.used === 8) {
+      this.bytes.push(this.current)
+      this.current = 0
+      this.used = 0
+    }
+  }
+
+  /** f(n): unsigned integer written MSB first. */
+  writeBits(value: number, n: number): void {
+    if (!Number.isSafeInteger(value) || value < 0 || value >= 2 ** n)
+      throw new RangeError(`BitWriter: ${value} does not fit in ${n} bits`)
+    for (let i = n - 1; i >= 0; i--)
+      this.writeBit(Math.floor(value / 2 ** i) & 1)
+  }
+
+  /** su(n): signed two's-complement value. */
+  su(value: number, n: number): void {
+    const min = -(2 ** (n - 1))
+    const max = 2 ** (n - 1) - 1
+    if (!Number.isInteger(value) || value < min || value > max)
+      throw new RangeError(`BitWriter: signed ${value} does not fit in ${n} bits`)
+    this.writeBits(value < 0 ? value + 2 ** n : value, n)
+  }
+
+  /** ns(n): non-symmetric unsigned value in [0, n). */
+  ns(value: number, n: number): void {
+    if (!Number.isInteger(value) || value < 0 || value >= n)
+      throw new RangeError(`BitWriter: ns value ${value} outside 0..${n - 1}`)
+    const w = floorLog2(n) + 1
+    const m = 2 ** w - n
+    if (value < m)
+      this.writeBits(value, w - 1)
+    else {
+      const v = value + m
+      this.writeBits(v >> 1, w - 1)
+      this.writeBit(v & 1)
+    }
+  }
+
+  /** Pad with zero bits to the next byte boundary. */
+  byteAlign(): void {
+    while (this.used !== 0)
+      this.writeBit(0)
+  }
+
+  /** Add AV1 trailing bits: one followed by zeroes to byte alignment. */
+  trailingBits(): void {
+    this.writeBit(1)
+    this.byteAlign()
+  }
+
+  finish(): Uint8Array {
+    if (this.used !== 0)
+      this.bytes.push(this.current)
+    return new Uint8Array(this.bytes)
+  }
+}
+
 /** FloorLog2 per spec 4.7: position of the most significant set bit. */
 export function floorLog2(x: number): number {
   let s = 0
