@@ -123,6 +123,8 @@ export interface FilmGrainParams {
 }
 
 export interface FrameHeader {
+  showExistingFrame: boolean
+  existingFrameIdx: number
   frameType: number
   showFrame: boolean
   showableFrame: boolean
@@ -164,6 +166,19 @@ export interface FrameHeader {
   txMode: number
   reducedTxSet: boolean
   filmGrain: FilmGrainParams | null
+  refFrameIdx: number[]
+  allowHighPrecisionMv: boolean
+  interpolationFilter: number
+  isMotionModeSwitchable: boolean
+  useRefFrameMvs: boolean
+  referenceSelect: boolean
+  skipModePresent: boolean
+  skipModeRefs: [number, number]
+  allowWarpedMotion: boolean
+}
+
+export interface FrameHeaderState {
+  refs: Array<FrameHeader | null>
 }
 
 function tileLog2(blkSize: number, target: number): number {
@@ -191,7 +206,7 @@ function readDeltaQ(r: BitReader): number {
  * after the header bits (call `byteAlign()` before reading tile group data
  * when parsing a FRAME OBU).
  */
-export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader {
+export function parseFrameHeader(r: BitReader, seq: SequenceHeader, state?: FrameHeaderState): FrameHeader {
   let frameType: number = FrameType.KEY
   let showFrame = true
   let showableFrame = false
@@ -201,10 +216,19 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
     ? seq.additionalFrameIdLength + seq.deltaFrameIdLength
     : 0
 
+  let showExistingFrame = false
+  let existingFrameIdx = -1
   if (!seq.reducedStillPictureHeader) {
-    const showExistingFrame = r.readBit() === 1
+    showExistingFrame = r.readBit() === 1
     if (showExistingFrame) {
-      throw new Error('ts-avif: show_existing_frame is not supported for still images')
+      existingFrameIdx = r.readBits(3)
+      if (seq.decoderModelInfoPresent && !seq.equalPictureInterval)
+        r.readBits(seq.framePresentationTimeLength)
+      if (seq.frameIdNumbersPresent) r.readBits(idLen)
+      const reference = state?.refs[existingFrameIdx]
+      if (!reference)
+        throw new Error(`ts-avif: show_existing_frame references unavailable slot ${existingFrameIdx}`)
+      return { ...reference, showExistingFrame: true, existingFrameIdx }
     }
     frameType = r.readBits(2)
     showFrame = r.readBit() === 1
@@ -221,17 +245,15 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
   }
 
   const frameIsIntra = frameType === FrameType.KEY || frameType === FrameType.INTRA_ONLY
-  if (!frameIsIntra)
-    throw new Error('ts-avif: inter frames are not supported (still images only)')
-
   const disableCdfUpdate = r.readBit() === 1
 
   const allowScreenContentTools = seq.seqForceScreenContentTools === SELECT_SCREEN_CONTENT_TOOLS
     ? r.readBit() === 1
     : seq.seqForceScreenContentTools === 1
-  if (allowScreenContentTools && seq.seqForceIntegerMv === SELECT_INTEGER_MV)
-    r.readBit() // force_integer_mv, always overridden to 1 for intra frames
-  const forceIntegerMv = true
+  let forceIntegerMv = false
+  if (allowScreenContentTools)
+    forceIntegerMv = seq.seqForceIntegerMv === SELECT_INTEGER_MV ? r.readBit() === 1 : seq.seqForceIntegerMv === 1
+  if (frameIsIntra) forceIntegerMv = true
 
   if (seq.frameIdNumbersPresent)
     r.readBits(idLen) // current_frame_id
@@ -243,7 +265,7 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
     frameSizeOverride = r.readBit() === 1
 
   const orderHint = r.readBits(seq.orderHintBits)
-  const primaryRefFrame = PRIMARY_REF_NONE // FrameIsIntra || error_resilient
+  const primaryRefFrame = !frameIsIntra && !errorResilientMode ? r.readBits(3) : PRIMARY_REF_NONE
 
   if (seq.decoderModelInfoPresent) {
     const bufferRemovalTimePresent = r.readBit() === 1
@@ -255,19 +277,45 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
     }
   }
 
-  let refreshFrameFlags = 0xFF
-  if (!(frameType === FrameType.SWITCH || (frameType === FrameType.KEY && showFrame)))
-    refreshFrameFlags = r.readBits(8)
+  const refreshFrameFlags = frameType === FrameType.SWITCH || (frameType === FrameType.KEY && showFrame)
+    ? 0xFF
+    : r.readBits(8)
 
   if (refreshFrameFlags !== 0xFF && errorResilientMode && seq.enableOrderHint) {
     for (let i = 0; i < 8; i++)
       r.readBits(seq.orderHintBits) // ref_order_hint
   }
 
-  // frame_size() + render_size(), intra path
+  const refFrameIdx: number[] = []
+  if (!frameIsIntra) {
+    const shortSignaling = seq.enableOrderHint && r.readBit() === 1
+    if (shortSignaling)
+      throw new Error('ts-avif: short inter reference signaling is not implemented')
+    for (let i = 0; i < 7; i++) {
+      refFrameIdx.push(r.readBits(3))
+      if (seq.frameIdNumbersPresent) r.readBits(seq.deltaFrameIdLength)
+      if (!state?.refs[refFrameIdx[i]])
+        throw new Error(`ts-avif: inter frame references unavailable slot ${refFrameIdx[i]}`)
+    }
+  }
+
+  // frame_size() / frame_size_with_refs() + render_size()
   let frameWidth: number
   let frameHeight: number
-  if (frameSizeOverride) {
+  let inherited: FrameHeader | null = null
+  if (!frameIsIntra && !errorResilientMode && frameSizeOverride) {
+    for (let i = 0; i < 7; i++) {
+      if (r.readBit() === 1) {
+        inherited = state!.refs[refFrameIdx[i]]
+        break
+      }
+    }
+  }
+  if (inherited) {
+    frameWidth = inherited.upscaledWidth
+    frameHeight = inherited.frameHeight
+  }
+  else if (frameSizeOverride) {
     frameWidth = r.readBits(seq.frameWidthBits) + 1
     frameHeight = r.readBits(seq.frameHeightBits) + 1
   }
@@ -287,17 +335,29 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
   const miCols = 2 * ((frameWidth + 7) >> 3)
   const miRows = 2 * ((frameHeight + 7) >> 3)
 
-  // render_size()
-  let renderWidth = upscaledWidth
-  let renderHeight = frameHeight
-  if (r.readBit() === 1) { // render_and_frame_size_different
+  // render_size() is inherited together with dimensions.
+  let renderWidth = inherited?.renderWidth ?? upscaledWidth
+  let renderHeight = inherited?.renderHeight ?? frameHeight
+  if (!inherited && r.readBit() === 1) {
     renderWidth = r.readBits(16) + 1
     renderHeight = r.readBits(16) + 1
   }
 
   let allowIntrabc = false
-  if (allowScreenContentTools && upscaledWidth === frameWidth)
+  if (frameIsIntra && allowScreenContentTools && upscaledWidth === frameWidth)
     allowIntrabc = r.readBit() === 1
+
+  let allowHighPrecisionMv = false
+  let interpolationFilter = 4 // SWITCHABLE
+  let isMotionModeSwitchable = false
+  let useRefFrameMvs = false
+  if (!frameIsIntra) {
+    if (!forceIntegerMv) allowHighPrecisionMv = r.readBit() === 1
+    interpolationFilter = r.readBit() === 1 ? 4 : r.readBits(2)
+    isMotionModeSwitchable = r.readBit() === 1
+    if (!errorResilientMode && seq.enableRefFrameMvs && seq.enableOrderHint)
+      useRefFrameMvs = r.readBit() === 1
+  }
 
   const disableFrameEndUpdateCdf
     = seq.reducedStillPictureHeader || disableCdfUpdate ? true : r.readBit() === 1
@@ -353,13 +413,45 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
   if (!codedLossless)
     txMode = r.readBit() === 1 ? TxModes.SELECT : TxModes.LARGEST
 
-  // frame_reference_mode(): intra -> reference_select = 0 (no bits)
-  // skip_mode_params(): SkipModeAllowed = 0 for intra -> no bits
-  // allow_warped_motion: FrameIsIntra -> 0 (no bits)
+  const referenceSelect = !frameIsIntra && r.readBit() === 1
+  const skipModeRefs: [number, number] = [-1, -1]
+  let skipModePresent = false
+  if (!frameIsIntra && seq.enableOrderHint) {
+    const candidates = refFrameIdx.map((slot, index) => ({
+      index,
+      distance: relativeDistance(state!.refs[slot]!.orderHint, orderHint, seq.orderHintBits),
+    }))
+    const forward = candidates.filter(item => item.distance < 0).sort((a, b) => b.distance - a.distance)
+    const backward = candidates.filter(item => item.distance > 0).sort((a, b) => a.distance - b.distance)
+    if (forward.length && backward.length) {
+      skipModeRefs[0] = Math.min(forward[0].index, backward[0].index)
+      skipModeRefs[1] = Math.max(forward[0].index, backward[0].index)
+    }
+    else if (forward.length > 1) {
+      // Aliases of the same reference slot/order hint do not count as the
+      // second forward reference required to enable skip mode.
+      const second = forward.find(item => item.distance < forward[0].distance)
+      if (second) {
+        skipModeRefs[0] = Math.min(forward[0].index, second.index)
+        skipModeRefs[1] = Math.max(forward[0].index, second.index)
+      }
+    }
+    if (skipModeRefs[0] >= 0) skipModePresent = r.readBit() === 1
+  }
+  const allowWarpedMotion = !frameIsIntra && !errorResilientMode && seq.enableWarpedMotion
+    ? r.readBit() === 1
+    : false
 
   const reducedTxSet = r.readBit() === 1
 
-  // global_motion_params(): no bits for intra frames
+  // Identity global motion is by far the common case. Non-identity models
+  // are rejected before their parameter payload can be misinterpreted.
+  if (!frameIsIntra) {
+    for (let ref = 0; ref < 7; ref++) {
+      if (r.readBit() === 1)
+        throw new Error('ts-avif: non-identity global motion is not implemented')
+    }
+  }
   // film_grain_params(); intra frames always carry a fresh parameter set.
   let filmGrain: FilmGrainParams | null = null
   if (seq.filmGrainParamsPresent && (showFrame || showableFrame)) {
@@ -421,6 +513,8 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
   }
 
   return {
+    showExistingFrame,
+    existingFrameIdx,
     frameType,
     showFrame,
     showableFrame,
@@ -460,7 +554,23 @@ export function parseFrameHeader(r: BitReader, seq: SequenceHeader): FrameHeader
     txMode,
     reducedTxSet,
     filmGrain,
+    refFrameIdx,
+    allowHighPrecisionMv,
+    interpolationFilter,
+    isMotionModeSwitchable,
+    useRefFrameMvs,
+    referenceSelect,
+    skipModePresent,
+    skipModeRefs,
+    allowWarpedMotion,
   }
+}
+
+function relativeDistance(a: number, b: number, bits: number): number {
+  if (!bits) return 0
+  const modulus = 1 << bits
+  const diff = (a - b) & (modulus - 1)
+  return diff & (modulus >> 1) ? diff - modulus : diff
 }
 
 function readGrainPoints(r: BitReader, maxPoints: number): [number, number][] {

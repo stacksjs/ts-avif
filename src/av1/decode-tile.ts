@@ -78,6 +78,12 @@ const FILTER_MODE_TO_Y_MODE_LOCAL = [
   IntraPredMode.DC_PRED,
 ]
 
+const Y_MODE_SIZE_CONTEXT = [3, 3, 3, 3, 3, 2, 3, 3, 2, 1, 2, 2, 2, 1, 0, 1, 1, 1, 0, 0, 0, 0]
+
+function yModeSizeContext(bs: BlockSize): number {
+  return Y_MODE_SIZE_CONTEXT[bs]
+}
+
 export interface Av1Block {
   bl: number
   bp: number
@@ -98,6 +104,10 @@ export interface Av1Block {
   /** Motion vector in AV1's 1/8-pixel units (integer-valued for intrabc). */
   mvX: number
   mvY: number
+  ref0: number
+  ref1: number
+  mvX2: number
+  mvY2: number
   tx: number
   uvtx: number
 }
@@ -124,6 +134,9 @@ class BlockContext {
   palettes: [Uint16Array, Uint16Array, Uint16Array]
   mvX: Int16Array
   mvY: Int16Array
+  ref0: Int8Array
+  ref1: Int8Array
+  compType: Uint8Array
 
   constructor(n4: number) {
     this.mode = new Uint8Array(n4)
@@ -142,6 +155,9 @@ class BlockContext {
     this.palettes = [new Uint16Array(n4 * 8), new Uint16Array(n4 * 8), new Uint16Array(n4 * 8)]
     this.mvX = new Int16Array(n4)
     this.mvY = new Int16Array(n4)
+    this.ref0 = new Int8Array(n4)
+    this.ref1 = new Int8Array(n4)
+    this.compType = new Uint8Array(n4)
   }
 
   reset(keyframe: boolean): void {
@@ -162,6 +178,9 @@ class BlockContext {
     this.palSzUv.fill(0)
     this.mvX.fill(0)
     this.mvY.fill(0)
+    this.ref0.fill(-1)
+    this.ref1.fill(-1)
+    this.compType.fill(0)
   }
 }
 
@@ -202,6 +221,7 @@ export class TileDecoder {
   ssHor: number
   ssVer: number
   layout: number
+  readonly frameIsIntra: boolean
 
   colStart = 0
   colEnd: number
@@ -247,12 +267,13 @@ export class TileDecoder {
     this.ssVer = seq.subsamplingY
     this.ssHor = seq.subsamplingX
     this.layout = seq.monochrome ? 0 : seq.subsamplingX === 0 ? 3 : seq.subsamplingY === 0 ? 2 : 1
+    this.frameIsIntra = hdr.frameType === 0 || hdr.frameType === 2
     this.colEnd = this.bw4
     this.rowEnd = this.bh4
     const aligned = (this.bw4 + 31) & ~31
     this.a = new BlockContext(aligned)
     this.l = new BlockContext(32)
-    this.a.reset(true)
+    this.a.reset(this.frameIsIntra)
 
     // The packed default context stores one MV component template; the two
     // components adapt independently once tile decoding begins.
@@ -275,7 +296,7 @@ export class TileDecoder {
     const sbStep = this.seq.use128x128Superblock ? 32 : 16
     const rootBl = this.seq.use128x128Superblock ? BlockLevel.BL_128X128 : BlockLevel.BL_64X64
     for (this.by = this.rowStart; this.by < this.rowEnd; this.by += sbStep) {
-      this.l.reset(true)
+      this.l.reset(this.frameIsIntra)
       for (this.bx = this.colStart; this.bx < this.colEnd; this.bx += sbStep) {
         this.cdefIdx[0] = this.cdefIdx[1] = this.cdefIdx[2] = this.cdefIdx[3] = -1
         this.restoration?.readForSuperblock(this.msac, this.cdf, this.bx, this.by)
@@ -503,6 +524,10 @@ export class TileDecoder {
       palIdxUv: null,
       mvX: 0,
       mvY: 0,
+      ref0: -1,
+      ref1: -1,
+      mvX2: 0,
+      mvY2: 0,
       tx: TxfmSize.TX_4X4,
       uvtx: TxfmSize.TX_4X4,
     }
@@ -512,13 +537,20 @@ export class TileDecoder {
     if (seg.enabled && seg.updateMap && seg.segIdPreSkip)
       b.segId = this.readSegId(this.bx, this.by, w4, h4, haveTop, haveLeft, false)
 
-    // skip_mode: never present in intra frames
-    b.skipMode = 0
+    if (!this.frameIsIntra && hdr.skipModePresent && Math.min(bw4, bh4) > 1) {
+      const smctx = this.a.skipMode[bx4] + this.l.skipMode[by4]
+      b.skipMode = msac.decodeBoolAdapt(cdf.data, cdf.offset('skip_mode', smctx))
+    }
 
     // skip
     {
-      const sctx = this.a.skip[bx4] + this.l.skip[by4]
-      b.skip = msac.decodeBoolAdapt(cdf.data, cdf.offset('skip', sctx))
+      if (b.skipMode) {
+        b.skip = 1
+      }
+      else {
+        const sctx = this.a.skip[bx4] + this.l.skip[by4]
+        b.skip = msac.decodeBoolAdapt(cdf.data, cdf.offset('skip', sctx))
+      }
     }
 
     // segment_id (post-skip)
@@ -602,19 +634,35 @@ export class TileDecoder {
       }
     }
 
-    // intra flag: key/intra frames without intrabc are always intra
-    b.intra = hdr.allowIntrabc
-      ? 1 - msac.decodeBoolAdapt(cdf.data, cdf.offset('intrabc'))
-      : 1
+    if (b.skipMode) {
+      b.intra = 0
+    }
+    else if (!this.frameIsIntra) {
+      const ictx = (haveLeft ? this.l.intra[by4] : 0)
+        + (haveTop ? this.a.intra[bx4] : 0)
+      b.intra = 1 - msac.decodeBoolAdapt(cdf.data, cdf.offset('intra', ictx))
+    }
+    else {
+      b.intra = hdr.allowIntrabc
+        ? 1 - msac.decodeBoolAdapt(cdf.data, cdf.offset('intrabc'))
+        : 1
+    }
     if (!b.intra) {
-      this.decodeIntrabcBlock(bs, b, bw4, bh4, w4, h4, cbw4, cbh4, hasChroma, bx4, by4)
+      if (this.frameIsIntra)
+        this.decodeIntrabcBlock(bs, b, bw4, bh4, w4, h4, cbw4, cbh4, hasChroma, bx4, by4)
+      else if (b.skipMode)
+        this.decodeSkipModeBlock(bs, b, bw4, bh4, w4, h4, cbw4, cbh4, hasChroma, bx4, by4)
+      else
+        this.decodeInterBlock(bs, b, bw4, bh4, w4, h4, cbw4, cbh4, hasChroma, bx4, by4, haveTop, haveLeft)
       return
     }
 
     // y mode (key-frame contexts from neighbors)
     const ctxA = INTRA_MODE_CONTEXT[this.a.mode[bx4]]
     const ctxL = INTRA_MODE_CONTEXT[this.l.mode[by4]]
-    b.yMode = msac.decodeSymbol(cdf.data, cdf.offset('kfym', ctxA, ctxL), 12)
+    b.yMode = this.frameIsIntra
+      ? msac.decodeSymbol(cdf.data, cdf.offset('kfym', ctxA, ctxL), 12)
+      : msac.decodeSymbol(cdf.data, cdf.offset('y_mode', yModeSizeContext(bs)), 12)
 
     const lw = BLOCK_DIMENSIONS[bDimOff + 2]
     const lh = BLOCK_DIMENSIONS[bDimOff + 3]
@@ -759,6 +807,245 @@ export class TileDecoder {
     if (hasChroma) {
       this.a.uvmode.fill(b.uvMode, cbx4, cbx4 + cbw4)
       this.l.uvmode.fill(b.uvMode, cby4, cby4 + cbh4)
+    }
+  }
+
+  /** Decode the compound zero/nearest predictor implied by skip_mode. */
+  private decodeSkipModeBlock(
+    bs: BlockSize,
+    b: Av1Block,
+    bw4: number,
+    bh4: number,
+    w4: number,
+    h4: number,
+    cbw4: number,
+    cbh4: number,
+    hasChroma: boolean,
+    bx4: number,
+    by4: number,
+  ): void {
+    b.ref0 = this.hdr.skipModeRefs[0]
+    b.ref1 = this.hdr.skipModeRefs[1]
+    // A frame with no spatial/temporal MV candidate uses the zero candidate.
+    // Candidate-stack refinement is added by the general inter path; this is
+    // sufficient for the normative skip-mode bootstrap case.
+    b.mvX = b.mvY = b.mvX2 = b.mvY2 = 0
+    b.yMode = IntraPredMode.DC_PRED
+    b.uvMode = IntraPredMode.DC_PRED
+    b.tx = MAX_TXFM_SIZE_FOR_BS[bs * 4]
+    b.uvtx = MAX_TXFM_SIZE_FOR_BS[bs * 4 + this.layout]
+
+    this.reconBIntra(bs, b, w4, h4, cbw4, cbh4, hasChroma, 0)
+
+    const tDim = TXFM_INFO[b.tx]
+    for (let i = 0; i < bw4; i++) {
+      const o = bx4 + i
+      this.a.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 2]
+      this.a.tx[o] = tDim.lw
+      this.a.mode[o] = 0
+      this.a.palSz[o] = 0
+      this.a.palSzUv[o] = 0
+      this.a.segPred[o] = 0
+      this.a.skipMode[o] = 1
+      this.a.intra[o] = 0
+      this.a.skip[o] = 1
+      this.a.mvX[o] = 0
+      this.a.mvY[o] = 0
+    }
+    for (let i = 0; i < bh4; i++) {
+      const o = by4 + i
+      this.l.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 3]
+      this.l.tx[o] = tDim.lh
+      this.l.mode[o] = 0
+      this.l.palSz[o] = 0
+      this.l.palSzUv[o] = 0
+      this.l.segPred[o] = 0
+      this.l.skipMode[o] = 1
+      this.l.intra[o] = 0
+      this.l.skip[o] = 1
+      this.l.mvX[o] = 0
+      this.l.mvY[o] = 0
+    }
+    if (hasChroma) {
+      const cbx4 = bx4 >> this.ssHor
+      const cby4 = by4 >> this.ssVer
+      this.a.uvmode.fill(IntraPredMode.DC_PRED, cbx4, cbx4 + cbw4)
+      this.l.uvmode.fill(IntraPredMode.DC_PRED, cby4, cby4 + cbh4)
+    }
+  }
+
+  /** Single-reference translational inter prediction. */
+  private decodeInterBlock(
+    bs: BlockSize,
+    b: Av1Block,
+    bw4: number,
+    bh4: number,
+    w4: number,
+    h4: number,
+    cbw4: number,
+    cbh4: number,
+    hasChroma: boolean,
+    bx4: number,
+    by4: number,
+    haveTop: boolean,
+    haveLeft: boolean,
+  ): void {
+    if (this.hdr.referenceSelect && Math.min(bw4, bh4) > 1) {
+      const comp = this.msac.decodeBoolAdapt(
+        this.cdf.data,
+        this.cdf.offset('comp', this.compContext(bx4, by4, haveTop, haveLeft)),
+      )
+      if (comp)
+        throw new Error('ts-avif: coded compound inter blocks are not implemented')
+    }
+
+    b.ref0 = this.readSingleReference(bx4, by4, haveTop, haveLeft)
+    b.ref1 = -1
+    const candidate = this.nearestMvCandidate(b.ref0, bx4, by4, haveTop, haveLeft)
+    b.mvX = candidate.x
+    b.mvY = candidate.y
+
+    // The mode context is zero when the candidate stack is empty, and the
+    // nearest spatial candidate supplies the low-context mode otherwise.
+    const modeContext = candidate.found ? 16 : 8
+    if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('newmv_mode', modeContext & 7))) {
+      if (!this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('globalmv_mode', (modeContext >> 3) & 1))) {
+        b.mvX = b.mvY = 0
+      }
+      else if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('refmv_mode', (modeContext >> 4) & 15))) {
+        // NEARMV uses a later candidate. A complete temporal candidate stack
+        // is required when no second spatial candidate exists.
+        throw new Error('ts-avif: near-motion inter candidates are not implemented')
+      }
+    }
+    else {
+      this.readMvResidual(b)
+    }
+
+    if (this.hdr.interpolationFilter === 4 && (b.mvX & 7 || b.mvY & 7))
+      throw new Error('ts-avif: switchable sub-pixel inter filters are not implemented')
+    if (b.mvX & 7 || b.mvY & 7)
+      throw new Error('ts-avif: sub-pixel inter prediction is not implemented')
+
+    b.yMode = IntraPredMode.DC_PRED
+    b.uvMode = IntraPredMode.DC_PRED
+    b.tx = MAX_TXFM_SIZE_FOR_BS[bs * 4]
+    b.uvtx = MAX_TXFM_SIZE_FOR_BS[bs * 4 + this.layout]
+    if (!b.skip && this.hdr.txMode === 2)
+      throw new Error('ts-avif: variable transform trees for coded inter blocks are not implemented')
+    this.reconBIntra(bs, b, w4, h4, cbw4, cbh4, hasChroma, 0)
+    this.updateInterContexts(bs, b, bw4, bh4, cbw4, cbh4, hasChroma, bx4, by4)
+  }
+
+  private readSingleReference(bx4: number, by4: number, haveTop: boolean, haveLeft: boolean): number {
+    const ctx1 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref >= 4)
+    if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 0, ctx1))) {
+      const ctx2 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 6)
+      if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 1, ctx2)))
+        return 6
+      const ctx3 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 5)
+      return 4 + this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 5, ctx3))
+    }
+    const ctx2 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref >= 2 && ref < 4)
+    if (this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 2, ctx2))) {
+      const ctx3 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 3)
+      return 2 + this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 4, ctx3))
+    }
+    const ctx3 = this.referenceContext(bx4, by4, haveTop, haveLeft, ref => ref === 1)
+    return this.msac.decodeBoolAdapt(this.cdf.data, this.cdf.offset('ref', 3, ctx3))
+  }
+
+  private referenceContext(
+    bx4: number,
+    by4: number,
+    haveTop: boolean,
+    haveLeft: boolean,
+    test: (ref: number) => boolean,
+  ): number {
+    let yes = 0
+    let no = 0
+    const count = (ctx: BlockContext, off: number): void => {
+      if (ctx.intra[off]) return
+      ;(test(ctx.ref0[off]) ? yes++ : no++)
+      if (ctx.compType[off]) (test(ctx.ref1[off]) ? yes++ : no++)
+    }
+    if (haveTop) count(this.a, bx4)
+    if (haveLeft) count(this.l, by4)
+    return yes === no ? 1 : yes > no ? 0 : 2
+  }
+
+  private compContext(bx4: number, by4: number, haveTop: boolean, haveLeft: boolean): number {
+    if (!haveTop && !haveLeft) return 1
+    const aComp = haveTop && this.a.compType[bx4] !== 0
+    const lComp = haveLeft && this.l.compType[by4] !== 0
+    if (aComp && lComp) return 4
+    if (aComp) return haveLeft ? 2 + (this.l.ref0[by4] >= 4 ? 1 : 0) : 3
+    if (lComp) return haveTop ? 2 + (this.a.ref0[bx4] >= 4 ? 1 : 0) : 3
+    if (haveTop && haveLeft) return (this.a.ref0[bx4] >= 4 ? 1 : 0) ^ (this.l.ref0[by4] >= 4 ? 1 : 0)
+    return (haveTop ? this.a.ref0[bx4] : this.l.ref0[by4]) >= 4 ? 1 : 0
+  }
+
+  private nearestMvCandidate(
+    ref: number,
+    bx4: number,
+    by4: number,
+    haveTop: boolean,
+    haveLeft: boolean,
+  ): { x: number, y: number, found: boolean } {
+    if (haveLeft && this.l.ref0[by4] === ref)
+      return { x: this.l.mvX[by4], y: this.l.mvY[by4], found: true }
+    if (haveTop && this.a.ref0[bx4] === ref)
+      return { x: this.a.mvX[bx4], y: this.a.mvY[bx4], found: true }
+    return { x: 0, y: 0, found: false }
+  }
+
+  private updateInterContexts(
+    bs: BlockSize,
+    b: Av1Block,
+    bw4: number,
+    bh4: number,
+    cbw4: number,
+    cbh4: number,
+    hasChroma: boolean,
+    bx4: number,
+    by4: number,
+  ): void {
+    const tDim = TXFM_INFO[b.tx]
+    for (let i = 0; i < bw4; i++) {
+      const o = bx4 + i
+      this.a.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 2]
+      this.a.tx[o] = tDim.lw
+      this.a.mode[o] = 0
+      this.a.palSz[o] = this.a.palSzUv[o] = 0
+      this.a.segPred[o] = 0
+      this.a.skipMode[o] = b.skipMode
+      this.a.intra[o] = 0
+      this.a.skip[o] = b.skip
+      this.a.mvX[o] = b.mvX
+      this.a.mvY[o] = b.mvY
+      this.a.ref0[o] = b.ref0
+      this.a.ref1[o] = b.ref1
+      this.a.compType[o] = b.ref1 >= 0 ? 1 : 0
+    }
+    for (let i = 0; i < bh4; i++) {
+      const o = by4 + i
+      this.l.txIntra[o] = BLOCK_DIMENSIONS[bs * 4 + 3]
+      this.l.tx[o] = tDim.lh
+      this.l.mode[o] = 0
+      this.l.palSz[o] = this.l.palSzUv[o] = 0
+      this.l.segPred[o] = 0
+      this.l.skipMode[o] = b.skipMode
+      this.l.intra[o] = 0
+      this.l.skip[o] = b.skip
+      this.l.mvX[o] = b.mvX
+      this.l.mvY[o] = b.mvY
+      this.l.ref0[o] = b.ref0
+      this.l.ref1[o] = b.ref1
+      this.l.compType[o] = b.ref1 >= 0 ? 1 : 0
+    }
+    if (hasChroma) {
+      this.a.uvmode.fill(IntraPredMode.DC_PRED, bx4 >> this.ssHor, (bx4 >> this.ssHor) + cbw4)
+      this.l.uvmode.fill(IntraPredMode.DC_PRED, by4 >> this.ssVer, (by4 >> this.ssVer) + cbh4)
     }
   }
 

@@ -18,11 +18,21 @@ import { upscaleFrame } from './superres'
 
 export interface DecodedFrame {
   buf: FrameBuffers
+  /** Post-restoration frame retained by AV1 reference slots (before grain). */
+  referenceBuf: FrameBuffers
+  /** Adapted entropy context saved by the context-update tile. */
+  cdf: CdfContext
   width: number
   height: number
 }
 
-export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]): DecodedFrame {
+export function decodeFrame(
+  seq: SequenceHeader,
+  hdr: FrameHeader,
+  tiles: Tile[],
+  references: Array<FrameBuffers | null> = [],
+  inheritedCdf: CdfContext | null = null,
+): DecodedFrame {
   let buf = new FrameBuffers(
     hdr.miCols,
     hdr.miRows,
@@ -31,7 +41,7 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     seq.monochrome,
     seq.bitDepth,
   )
-  const recon = new PixelReconstructor(buf, seq)
+  const recon = new PixelReconstructor(buf, seq, references)
   const lfActive = hdr.loopFilter.levels[0] !== 0 || hdr.loopFilter.levels[1] !== 0
   if (lfActive) {
     recon.lf = new LoopFilterData(hdr.miCols, hdr.miRows, seq.subsamplingX, seq.subsamplingY)
@@ -43,10 +53,11 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
   const sbRoot = INTRA_EDGE_TREE[seq.use128x128Superblock ? 0 : 1]
 
   const { tileCols, tileRows, miColStarts, miRowStarts } = hdr.tileInfo
+  let frameCdf = inheritedCdf?.clone() ?? new CdfContext(hdr.quantization.baseQIdx)
   for (const tile of tiles) {
     if (tile.tileRow >= tileRows || tile.tileCol >= tileCols)
       throw new Error(`ts-avif: tile ${tile.tileNum} outside the tile grid`)
-    const cdf = new CdfContext(hdr.quantization.baseQIdx)
+    const cdf = inheritedCdf?.clone() ?? new CdfContext(hdr.quantization.baseQIdx)
     const dec = new TileDecoder(seq, hdr, tile.data, cdf, recon)
     dec.colStart = miColStarts[tile.tileCol]
     dec.colEnd = Math.min(miColStarts[tile.tileCol + 1], hdr.miCols)
@@ -55,6 +66,8 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
     dec.cdefData = cdefData
     dec.restoration = restorationInfo
     dec.decodeTile(sbRoot)
+    if (tile.tileNum === hdr.tileInfo.contextUpdateTileId)
+      frameCdf = cdf
   }
 
   if (recon.lf)
@@ -110,10 +123,11 @@ export function decodeFrame(seq: SequenceHeader, hdr: FrameHeader, tiles: Tile[]
   if (lrActive && deblocked)
     applyRestoration(buf, restorationInfo!, seq, hdr, deblocked)
 
+  const referenceBuf = buf
   if (hdr.filmGrain)
-    buf = applyFilmGrain(buf, seq, hdr.filmGrain, hdr.upscaledWidth, hdr.frameHeight)
+    buf = applyFilmGrain(referenceBuf, seq, hdr.filmGrain, hdr.upscaledWidth, hdr.frameHeight)
 
-  return { buf, width: hdr.upscaledWidth, height: hdr.frameHeight }
+  return { buf, referenceBuf, cdf: frameCdf, width: hdr.upscaledWidth, height: hdr.frameHeight }
 }
 
 /**

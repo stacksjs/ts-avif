@@ -102,7 +102,11 @@ export class PixelReconstructor {
   lf: LoopFilterData | null = null
   lfLevels: Uint8Array | null = null
 
-  constructor(readonly buf: FrameBuffers, readonly seq: SequenceHeader) {
+  constructor(
+    readonly buf: FrameBuffers,
+    readonly seq: SequenceHeader,
+    readonly references: Array<FrameBuffers | null> = [],
+  ) {
     this.edge = createPixelPlane(260, seq.bitDepth)
     this.intraEdgeFilterFlag = seq.enableIntraEdgeFilter ? 1 << 10 : 0
   }
@@ -123,8 +127,12 @@ export class PixelReconstructor {
 
     const bw4 = BLOCK_DIMENSIONS[bs * 4]
     const bh4 = BLOCK_DIMENSIONS[bs * 4 + 1]
-    if (!b.intra)
-      this.copyIntrabcPredictor(b, dec, bw4, bh4)
+    if (!b.intra) {
+      if (dec.frameIsIntra)
+        this.copyIntrabcPredictor(b, dec, bw4, bh4)
+      else
+        this.copyInterPredictor(b, dec, bw4, bh4)
+    }
     if (b.palSz[0] && b.palIdxY) {
       const width = bw4 * 4
       const height = bh4 * 4
@@ -167,6 +175,39 @@ export class PixelReconstructor {
         block.set(pixels.subarray((srcY + y) * stride + srcX, (srcY + y) * stride + srcX + width), y * width)
       for (let y = 0; y < height; y++)
         pixels.set(block.subarray(y * width, (y + 1) * width), (dstY + y) * stride + dstX)
+    }
+  }
+
+  private copyInterPredictor(b: Av1Block, dec: TileDecoder, bw4: number, bh4: number): void {
+    const first = this.references[b.ref0]
+    const second = b.ref1 >= 0 ? this.references[b.ref1] : null
+    if (!first)
+      throw new Error(`ts-avif: inter block references unavailable frame ${b.ref0}`)
+    for (let plane = 0; plane < (this.seq.monochrome ? 1 : 3); plane++) {
+      const ssHor = plane ? dec.ssHor : 0
+      const ssVer = plane ? dec.ssVer : 0
+      const width = ((bw4 + ssHor) >> ssHor) * 4
+      const height = ((bh4 + ssVer) >> ssVer) * 4
+      const dstX = (dec.bx >> ssHor) * 4
+      const dstY = (dec.by >> ssVer) * 4
+      const srcX = dstX + (b.mvX >> (3 + ssHor))
+      const srcY = dstY + (b.mvY >> (3 + ssVer))
+      const srcX2 = dstX + (b.mvX2 >> (3 + ssHor))
+      const srcY2 = dstY + (b.mvY2 >> (3 + ssVer))
+      const dstStride = this.buf.stride(plane)
+      const srcStride = first.stride(plane)
+      const dst = this.buf.plane(plane)
+      const src = first.plane(plane)
+      const src2 = second?.plane(plane)
+      const srcStride2 = second?.stride(plane) ?? 0
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const a = src[(srcY + y) * srcStride + srcX + x]
+          dst[(dstY + y) * dstStride + dstX + x] = src2
+            ? (a + src2[(srcY2 + y) * srcStride2 + srcX2 + x] + 1) >> 1
+            : a
+        }
+      }
     }
   }
 

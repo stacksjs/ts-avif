@@ -3,7 +3,7 @@
  * uncompressed header, then slice the payload into per-tile byte ranges for
  * the entropy decoder.
  */
-import type { FrameHeader } from './frame-header'
+import type { FrameHeader, FrameHeaderState } from './frame-header'
 import type { SequenceHeader } from './sequence'
 import { BitReader } from './bits'
 import { parseFrameHeader } from './frame-header'
@@ -21,9 +21,15 @@ export interface ParsedFrame {
 }
 
 /** Parse a FRAME OBU payload: uncompressed header + one tile group. */
-export function parseFrameOBU(data: Uint8Array, seq: SequenceHeader): ParsedFrame {
+export function parseFrameOBU(
+  data: Uint8Array,
+  seq: SequenceHeader,
+  state?: FrameHeaderState,
+): ParsedFrame {
   const r = new BitReader(data)
-  const header = parseFrameHeader(r, seq)
+  const header = parseFrameHeader(r, seq, state)
+  if (header.showExistingFrame)
+    return { header, tiles: [] }
   r.byteAlign()
   const offset = r.bitPosition >> 3
   const tiles = parseTileGroup(data.subarray(offset), header)

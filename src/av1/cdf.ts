@@ -55,11 +55,21 @@ export type CdfTableName = keyof typeof MODE_OFFSETS | keyof typeof COEF_OFFSETS
 export class CdfContext {
   readonly data: Uint16Array
 
-  constructor(baseQIdx: number) {
+  constructor(baseQIdx: number, inherited?: Uint16Array) {
     this.data = new Uint16Array(MODE_SIZE + COEF_SIZE)
+    if (inherited) {
+      if (inherited.length !== this.data.length)
+        throw new Error('ts-avif: inherited CDF context has an invalid size')
+      this.data.set(inherited)
+      return
+    }
     this.data.set(DEFAULT_MODE, 0)
     const qcat = (baseQIdx > 20 ? 1 : 0) + (baseQIdx > 60 ? 1 : 0) + (baseQIdx > 120 ? 1 : 0)
     this.data.set(DEFAULT_COEF[qcat], MODE_SIZE)
+  }
+
+  clone(): CdfContext {
+    return new CdfContext(0, this.data)
   }
 
   /**
