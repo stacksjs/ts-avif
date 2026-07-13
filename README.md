@@ -1,135 +1,217 @@
 # ts-avif
 
-A pure TypeScript AVIF encoder and decoder with zero native dependencies.
+Pure TypeScript AVIF encoding and decoding with zero runtime dependencies.
 
-## Features
+`ts-avif` reads and writes AVIF still images without native bindings, WebAssembly, or subprocesses. It includes an AV1 intra decoder, a compact intra encoder, HEIF/ISOBMFF container tools, metadata inspection, and lossless container optimization.
 
-- 🚀 Pure TypeScript - no native dependencies
-- 📦 Zero dependencies
-- 🎨 HEIF/ISOBMFF container support
-- 🔄 8-bit AV1 still-image decoder
-- ✍️ Bundled 8-bit intra encoder (no `avifenc` subprocess)
+> [!IMPORTANT]
+> The codec currently targets opaque, 8-bit, intra-only still images. See [Codec support](#codec-support) for the exact feature set.
 
-## Installation
+## Install
 
 ```bash
-bun add ts-avif
-# or
-npm install ts-avif
+npm install @stacksjs/ts-avif
 ```
 
-## Usage
-
-### Decoding
-
-```typescript
-import { decode } from 'ts-avif'
-
-const buffer = await Bun.file('image.avif').arrayBuffer()
-const { data, width, height, hasAlpha, bitDepth } = decode(new Uint8Array(buffer))
-
-// data is RGBA pixel data (4 bytes per pixel)
-console.log(`Image size: ${width}x${height}, bit depth: ${bitDepth}`)
+```bash
+bun add @stacksjs/ts-avif
 ```
 
-### Encoding
+```bash
+pnpm add @stacksjs/ts-avif
+```
 
-```typescript
-import { encode } from 'ts-avif'
+## Quick start
 
-const imageData = {
-  data: new Uint8Array(width * height * 4), // RGBA pixel data
-  width: 100,
-  height: 100,
-}
+### Decode an AVIF image
 
-const avifBuffer = encode(imageData, {
-  quality: 80,
-  chromaSubsampling: '4:2:0',
+```ts
+import { readFile } from 'node:fs/promises'
+import { decode } from '@stacksjs/ts-avif'
+
+const input = await readFile('input.avif')
+const image = decode(input)
+
+console.log(image.width, image.height)
+console.log(image.data) // RGBA, four bytes per pixel
+```
+
+Request packed RGB output when an alpha byte is not needed:
+
+```ts
+const image = decode(input, { format: 'rgb' })
+// image.data contains three bytes per pixel
+```
+
+### Encode RGBA pixels
+
+```ts
+import { writeFile } from 'node:fs/promises'
+import { encode } from '@stacksjs/ts-avif'
+
+const width = 640
+const height = 480
+const rgba = new Uint8Array(width * height * 4)
+
+// Fill rgba with opaque pixel data.
+
+const output = encode(
+  { data: rgba, width, height },
+  { quality: 82 },
+)
+
+await writeFile('output.avif', output)
+```
+
+The encoder accepts opaque 8-bit RGBA input and produces a full-range BT.709, 4:2:0 AVIF image. `quality` ranges from `0` to `100` and defaults to `80`.
+
+For promise-based pipelines, `encodeAsync()` exposes the same operation and options:
+
+```ts
+import { encodeAsync } from '@stacksjs/ts-avif'
+
+const output = await encodeAsync({ data: rgba, width, height })
+```
+
+### Read metadata without decoding pixels
+
+```ts
+import { getAvifMetadata } from '@stacksjs/ts-avif'
+
+const metadata = getAvifMetadata(input)
+
+console.log({
+  width: metadata.width,
+  height: metadata.height,
+  bitDepth: metadata.bitDepth,
+  hasAlpha: metadata.hasAlpha,
+  rotation: metadata.rotation,
+  mirror: metadata.mirror,
+  grid: metadata.grid,
 })
-await Bun.write('output.avif', avifBuffer)
 ```
 
-### Get File Info
+Metadata inspection understands item/property associations, grid descriptors, auxiliary alpha items, and rotation and mirror properties.
 
-```typescript
-import { parseISOBMFF, getAvifInfo } from 'ts-avif'
+### Optimize an existing AVIF
 
-const buffer = await Bun.file('image.avif').arrayBuffer()
-const boxes = parseISOBMFF(new Uint8Array(buffer))
-const info = getAvifInfo(boxes)
+`optimize()` losslessly rewrites the container and returns the smaller of the original and optimized files. Encoded AV1 image data is preserved byte-for-byte.
 
-console.log(info)
-// {
-//   width: 1920,
-//   height: 1080,
-//   hasAlpha: false,
-//   bitDepth: 10,
-//   colorSpace: 'srgb',
-//   isSequence: false
-// }
+```ts
+import { optimizeWithStats } from '@stacksjs/ts-avif'
+
+const { bytes, stats } = optimizeWithStats(input)
+
+console.log(`Saved ${stats.bytesSaved} bytes`)
+console.log(`Removed item types: ${stats.droppedItemTypes.join(', ')}`)
 ```
+
+The optimizer can remove metadata and thumbnail items, unused references, padding boxes, and redundant compatible brands while retaining the primary image and auxiliary alpha data.
 
 ## API
 
-### `decode(buffer: Uint8Array, options?: AvifDecodeOptions): AvifImageData`
+### High-level API
 
-Decodes an AVIF image buffer to RGBA pixel data.
+| Export | Description |
+| --- | --- |
+| `decode(input, options?)` | Decode an AVIF file into RGBA or RGB pixels. |
+| `encode(image, options?)` | Encode opaque RGBA pixels into an AVIF file. |
+| `encodeAsync(image, options?)` | Promise-returning form of `encode()`. |
+| `getAvifMetadata(input)` | Inspect image, item, color-depth, grid, and transform metadata. |
+| `optimize(input)` | Losslessly optimize a container, keeping the smaller result. |
+| `optimizeWithStats(input)` | Optimize and return details about the result. |
+| `remux(input)` | Force a fresh, stripped container without the smaller-result guard. |
 
-**Options:**
+### Decode options
 
-- `format?: 'rgba' | 'rgb'` - Output format (default: 'rgba')
-- `ignoreAlpha?: boolean` - Ignore alpha channel
+```ts
+interface AvifDecodeOptions {
+  format?: 'rgba' | 'rgb'
+  ignoreAlpha?: boolean
+}
+```
 
-**Returns:**
+- `format` defaults to `'rgba'`.
+- `ignoreAlpha` skips decoding an auxiliary alpha image when present.
 
-- `data: Uint8Array` - Pixel data
-- `width: number` - Image width in pixels
-- `height: number` - Image height in pixels
-- `hasAlpha?: boolean` - Whether the image has an alpha channel
-- `bitDepth?: 8 | 10 | 12` - Color bit depth
+### Encode options
 
-### `encode(imageData: AvifImageData, options?: AvifEncodeOptions): Uint8Array`
+```ts
+interface AvifEncodeOptions {
+  quality?: number
+  lossless?: boolean
+  effort?: number
+  alpha?: boolean
+  chromaSubsampling?: '4:2:0' | '4:2:2' | '4:4:4'
+}
+```
 
-Encodes RGBA pixel data to AVIF format.
+- `quality` accepts `0` through `100` and defaults to `80`.
+- `effort` is reserved for future encoder tuning and is currently ignored.
+- `lossless: true`, `alpha: true`, and chroma formats other than `4:2:0` currently throw explicit errors.
 
-**Options:**
+### Low-level tools
 
-- `quality?: number` - Quality (0-100, default: 80)
-- `lossless?: boolean` - Reserved; currently throws when enabled
-- `effort?: number` - Reserved speed/effort trade-off
-- `alpha?: boolean` - Reserved; currently throws when enabled
-- `chromaSubsampling?: '4:2:0'` - The current encoder output format
+Advanced consumers can work directly with the container and AV1 layers:
 
-## Container Format
+- `encodeAV1()` and `decodeAV1()` for low-overhead AV1 OBU streams
+- `parseISOBMFF()`, `findBox()`, and `findAllBoxes()` for container inspection
+- AVIF item, item-location, property-association, and grid parsers
+- `parseOBUs()`, `createOBU()`, and `writeLeb128()` for AV1 OBU handling
 
-The library fully supports parsing HEIF/ISOBMFF container format:
+All public types are exported from the package entry point.
 
-- `ftyp` - File type box
-- `meta` - Metadata container
-- `hdlr` - Handler box
-- `pitm` - Primary item box
-- `iloc` - Item location box
-- `iinf` - Item info box
-- `iprp` - Item properties box
-- `mdat` - Media data box
+## Codec support
 
-## Technical Notes
+### Decoder
 
-This is a pure TypeScript AVIF implementation focused on 8-bit intra still images. The encoder writes real AV1 sequence, frame, partition, mode, and coefficient syntax using adaptive arithmetic coding; it does not shell out to a native codec.
+The decoder supports the 8-bit AV1 intra path used by still images, including:
 
-Key components:
+- Intra prediction and inverse transforms
+- Deblocking, CDEF, and loop restoration
+- Segmentation and switchable restoration modes
+- Auxiliary alpha decoding for supported 8-bit intra streams
+- HEIF item lookup with absolute and `idat`-relative extents
 
-- HEIF container parsing (ISO Base Media File Format)
-- AV1 OBU (Open Bitstream Unit) parsing
-- Bit-exact AV1 intra prediction, inverse transforms, deblocking, CDEF, and loop restoration
-- 4×4 DC-predicted DCT encoder with full-range BT.709 4:2:0 output
+Unsupported syntax fails explicitly instead of returning silently corrupted pixels. This currently includes:
 
-## Limitations
+- 10-bit and 12-bit samples
+- Inter frames and animation
+- Intra block copy and palette mode
+- Film grain, quantization matrices, and super-resolution
+- 128×128 superblocks
 
-- The encoder accepts opaque 8-bit RGBA images up to 4096×2304. Alpha, lossless mode, and 4:2:2/4:4:4 encoding throw explicitly.
-- The decoder supports the 8-bit intra path. 10/12-bit, inter frames, intra-block copy, palette, film grain, quantizer matrices, super-resolution, and 128×128 superblocks throw explicitly.
-- Animation is not implemented.
+### Encoder
+
+The bundled encoder writes real AV1 sequence, frame, partition, mode, transform-coefficient, and adaptive arithmetic syntax. Its current profile is intentionally focused:
+
+- Opaque 8-bit RGBA input
+- Full-range BT.709 YUV 4:2:0 output
+- Intra-only, single-tile still images
+- 4×4 DC-predicted DCT blocks
+- Maximum dimensions of 4096×2304
+
+Alpha encoding, lossless encoding, 4:2:2 and 4:4:4 chroma, animation, and more advanced encoder decisions are not yet implemented.
+
+## Container support
+
+The HEIF/ISOBMFF layer handles the AVIF structures needed for image lookup, metadata, encoding, and optimization, including `ftyp`, `meta`, `pitm`, `iloc`, `iinf`, `iref`, `iprp`, `ipco`, `ipma`, `idat`, and `mdat`.
+
+## Development
+
+```bash
+bun install
+bun test
+bun run typecheck
+bun run lint
+bun run build
+```
+
+The decoder is covered by bit-exact fixtures generated from compiled AV1 kernels, alongside full-file decode and encode/decode integration tests.
+
+## Credits
+
+Codec behavior and interoperability were validated with the [dav1d](https://code.videolan.org/videolan/dav1d) and [rav1e](https://github.com/xiph/rav1e) projects. Their work is invaluable to the wider AV1 ecosystem.
 
 ## License
 
