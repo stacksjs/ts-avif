@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.1...v0.1.2)
+
+## 🐛 Bug Fixes
+
+- **test**: speed up ipred vectors test to avoid CI timeout ([7156be6](https://github.com/stacksjs/ts-avif/commit/7156be6)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.2 ([745501c](https://github.com/stacksjs/ts-avif/commit/745501c)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.0...v0.1.1)
 
 ## 🚀 Features
