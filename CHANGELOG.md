@@ -1,5 +1,20 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.2...v0.1.3)
+
+## 🐛 Bug Fixes
+
+- remove consumer postinstall hook ([bfac6ce](https://github.com/stacksjs/ts-avif/commit/bfac6ce)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.3 ([95ab274](https://github.com/stacksjs/ts-avif/commit/95ab274)) _(by Chris <chrisbreuer93@gmail.com>)_
+- **deps**: declare bun ^1.3.14 in deps.yaml ([f38cfa6](https://github.com/stacksjs/ts-avif/commit/f38cfa6)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.1...v0.1.2)
 
 ## 🐛 Bug Fixes
