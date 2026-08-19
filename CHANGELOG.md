@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.3...v0.1.4)
+
+## ⚡ Performance Improvements
+
+- **build**: cut the waste out of the published output ([ac61ff5](https://github.com/stacksjs/ts-avif/commit/ac61ff5)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.4 ([c87ba93](https://github.com/stacksjs/ts-avif/commit/c87ba93)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.2...v0.1.3)
 
 ## 🐛 Bug Fixes
