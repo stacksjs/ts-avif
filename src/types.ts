@@ -37,8 +37,13 @@ export interface AvifEncodeOptions {
   lossless?: boolean
   /** Reserved speed/effort trade-off (0-10); currently ignored. */
   effort?: number
-  /** Enable alpha channel (not implemented; throws when true). */
+  /**
+   * Carry transparency. Default: on whenever a pixel is not fully opaque.
+   * `false` drops the alpha channel and encodes the colour image alone.
+   */
   alpha?: boolean
+  /** Quality for the alpha plane, 0-100. Default: `quality`. */
+  alphaQuality?: number
   /** Chroma subsampling (only '4:2:0' is currently supported). */
   chromaSubsampling?: '4:2:0' | '4:2:2' | '4:4:4'
 }

@@ -472,6 +472,13 @@ export function getAvifInfo(boxes: ISOBMFFBox[]): AvifInfo {
     hasAlpha = items.some(item => item.itemType === 'auxl' || item.itemName.includes('Alpha'))
   }
 
+  // A conformant file marks alpha with an `auxl` reference, not an item type.
+  // (Which auxiliary it is gets settled by `findAlphaItemId`; this is the
+  // cheap summary flag.)
+  const irefBox = findBox(metaBox.children, 'iref')
+  if (irefBox?.children?.some(child => child.type === 'auxl'))
+    hasAlpha = true
+
   // Check for sequence
   const isSequence = boxes.some(box => box.type === 'moov')
 

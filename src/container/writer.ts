@@ -1,21 +1,45 @@
 import { createFtyp } from './heif'
 
-/** Wrap one AV1 still-picture stream in a single-item AVIF/HEIF container. */
-export function writeAvif(av1Data: Uint8Array, width: number, height: number): Uint8Array {
+/**
+ * The URN an auxiliary image carries to say "I am this image's alpha"
+ * (ISO/IEC 23008-12 / MIAF). Every AVIF decoder keys transparency off it.
+ */
+export const ALPHA_URN = 'urn:mpeg:mpegB:cicp:systems:auxiliary:alpha'
+
+const COLOR_ITEM = 1
+const ALPHA_ITEM = 2
+
+/**
+ * Wrap AV1 still pictures in an AVIF/HEIF container.
+ *
+ * With `alphaData`, the file holds two `av01` items: the colour image (item 1,
+ * primary) and its alpha (item 2), which an `auxl` reference ties to item 1
+ * and an `auxC` property marks as alpha. Without it, a single item as before.
+ */
+export function writeAvif(av1Data: Uint8Array, width: number, height: number, alphaData?: Uint8Array): Uint8Array {
+  const payloads = alphaData ? [av1Data, alphaData] : [av1Data]
+
   const ftyp = createFtyp()
   const hdlr = pictHandler()
-  const pitm = box('pitm', new Uint8Array([0, 0, 0, 0, 0, 1]))
-  const iinf = itemInfo()
-  const iprp = itemProperties(width, height)
+  const pitm = box('pitm', new Uint8Array([0, 0, 0, 0, 0, COLOR_ITEM]))
+  const iinf = itemInfo(payloads.length)
+  const iref = alphaData ? auxlReference() : new Uint8Array(0)
+  const iprp = itemProperties(width, height, Boolean(alphaData))
 
   // iloc has a fixed size, so a placeholder pass is enough to establish the
-  // absolute start of the mdat payload before writing its final offset.
-  const placeholderIloc = itemLocation(0, av1Data.length)
-  const metaSize = 12 + hdlr.length + pitm.length + placeholderIloc.length + iinf.length + iprp.length
-  const payloadOffset = ftyp.length + metaSize + 8
-  const iloc = itemLocation(payloadOffset, av1Data.length)
-  const meta = box('meta', concat([new Uint8Array(4), hdlr, pitm, iloc, iinf, iprp]))
-  const mdat = box('mdat', av1Data)
+  // absolute start of the mdat payload before writing its final offsets.
+  const placeholderIloc = itemLocation(payloads.map(payload => ({ offset: 0, length: payload.length })))
+  const metaSize = 12 + hdlr.length + pitm.length + placeholderIloc.length + iinf.length + iref.length + iprp.length
+  let offset = ftyp.length + metaSize + 8
+  const extents = payloads.map((payload) => {
+    const extent = { offset, length: payload.length }
+    offset += payload.length
+    return extent
+  })
+
+  const iloc = itemLocation(extents)
+  const meta = box('meta', concat([new Uint8Array(4), hdlr, pitm, iloc, iinf, iref, iprp]))
+  const mdat = box('mdat', concat(payloads))
   return concat([ftyp, meta, mdat])
 }
 
@@ -27,45 +51,61 @@ function pictHandler(): Uint8Array {
   return box('hdlr', payload)
 }
 
-function itemInfo(): Uint8Array {
-  const infePayload = new Uint8Array(13)
-  infePayload[0] = 2 // FullBox version 2
-  const infeView = new DataView(infePayload.buffer)
-  infeView.setUint16(4, 1) // item_ID
-  infeView.setUint16(6, 0) // item_protection_index
-  writeType(infePayload, 8, 'av01')
-  infePayload[12] = 0 // empty item_name
-  const infe = box('infe', infePayload)
+function itemInfo(count: number): Uint8Array {
+  const entries: Uint8Array[] = []
+  for (let itemId = 1; itemId <= count; itemId++) {
+    const infePayload = new Uint8Array(13)
+    infePayload[0] = 2 // FullBox version 2
+    const infeView = new DataView(infePayload.buffer)
+    infeView.setUint16(4, itemId)
+    infeView.setUint16(6, 0) // item_protection_index
+    writeType(infePayload, 8, 'av01')
+    infePayload[12] = 0 // empty item_name
+    entries.push(box('infe', infePayload))
+  }
 
-  const payload = new Uint8Array(6 + infe.length)
-  new DataView(payload.buffer).setUint16(4, 1)
-  payload.set(infe, 6)
-  return box('iinf', payload)
+  const header = new Uint8Array(6)
+  new DataView(header.buffer).setUint16(4, count)
+  return box('iinf', concat([header, ...entries]))
 }
 
-function itemLocation(offset: number, length: number): Uint8Array {
-  const payload = new Uint8Array(22)
+/** `iref` holding one `auxl` reference: alpha item -> colour item. */
+function auxlReference(): Uint8Array {
+  const auxlPayload = new Uint8Array(6)
+  const view = new DataView(auxlPayload.buffer)
+  view.setUint16(0, ALPHA_ITEM) // from_item_ID
+  view.setUint16(2, 1) // reference_count
+  view.setUint16(4, COLOR_ITEM) // to_item_ID
+  return box('iref', concat([new Uint8Array(4), box('auxl', auxlPayload)]))
+}
+
+function itemLocation(extents: { offset: number, length: number }[]): Uint8Array {
+  const payload = new Uint8Array(8 + extents.length * 14)
   const view = new DataView(payload.buffer)
   payload[4] = 0x44 // offset_size=4, length_size=4
   payload[5] = 0x00 // base_offset_size=0
-  view.setUint16(6, 1) // item_count
-  view.setUint16(8, 1) // item_ID
-  view.setUint16(10, 0) // data_reference_index
-  view.setUint16(12, 1) // extent_count
-  view.setUint32(14, offset)
-  view.setUint32(18, length)
+  view.setUint16(6, extents.length) // item_count
+  extents.forEach((extent, index) => {
+    const at = 8 + index * 14
+    view.setUint16(at, index + 1) // item_ID
+    view.setUint16(at + 2, 0) // data_reference_index
+    view.setUint16(at + 4, 1) // extent_count
+    view.setUint32(at + 6, extent.offset)
+    view.setUint32(at + 10, extent.length)
+  })
   return box('iloc', payload)
 }
 
-function itemProperties(width: number, height: number): Uint8Array {
+function itemProperties(width: number, height: number, withAlpha: boolean): Uint8Array {
   const ispePayload = new Uint8Array(12)
   const ispeView = new DataView(ispePayload.buffer)
   ispeView.setUint32(4, width)
   ispeView.setUint32(8, height)
   const ispe = box('ispe', ispePayload)
 
-  const pixiPayload = new Uint8Array([0, 0, 0, 0, 3, 8, 8, 8])
-  const pixi = box('pixi', pixiPayload)
+  // Both items are 8-bit 4:2:0 bitstreams, so both carry three channels; the
+  // alpha item's chroma is flat and decoders read only its luma.
+  const pixi = box('pixi', new Uint8Array([0, 0, 0, 0, 3, 8, 8, 8]))
 
   // marker=1, version=1, Main profile/level 2.0, 8-bit 4:2:0.
   const av1c = box('av1C', new Uint8Array([0x81, 0x00, 0x0C, 0x00]))
@@ -79,18 +119,26 @@ function itemProperties(width: number, height: number): Uint8Array {
   colrPayload[10] = 0x80 // full_range_flag
   const colr = box('colr', colrPayload)
 
-  const ipco = box('ipco', concat([ispe, pixi, av1c, colr]))
-  const ipmaPayload = new Uint8Array(12)
-  const ipmaView = new DataView(ipmaPayload.buffer)
-  ipmaView.setUint32(4, 1) // entry_count
-  ipmaView.setUint16(8, 1) // item_ID
-  ipmaPayload[10] = 4 // association_count
-  ipmaPayload[11] = 1 // ispe; overwritten below after growing
+  // Property indices are 1-based positions in ipco.
+  const properties = [ispe, pixi, av1c, colr]
+  if (withAlpha) {
+    const urn = new TextEncoder().encode(`${ALPHA_URN}\0`)
+    properties.push(box('auxC', concat([new Uint8Array(4), urn])))
+  }
+  const ipco = box('ipco', concat(properties))
 
-  const associations = new Uint8Array(15)
-  associations.set(ipmaPayload.subarray(0, 11))
-  associations.set([1, 2, 0x80 | 3, 4], 11)
-  const ipma = box('ipma', associations)
+  const ESSENTIAL = 0x80
+  const associations: [number, number[]][] = [
+    [COLOR_ITEM, [1, 2, ESSENTIAL | 3, 4]],
+  ]
+  if (withAlpha)
+    associations.push([ALPHA_ITEM, [1, 2, ESSENTIAL | 3, ESSENTIAL | 5]])
+
+  const ipmaParts: number[] = [0, 0, 0, 0, 0, 0, 0, associations.length]
+  for (const [itemId, indices] of associations)
+    ipmaParts.push(itemId >> 8, itemId & 0xFF, indices.length, ...indices)
+  const ipma = box('ipma', new Uint8Array(ipmaParts))
+
   return box('iprp', concat([ipco, ipma]))
 }
 

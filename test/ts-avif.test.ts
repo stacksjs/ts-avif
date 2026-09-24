@@ -242,6 +242,58 @@ describe('ts-avif', () => {
     })
   })
 
+  describe('alpha', () => {
+    // A cutout: an opaque disc on a transparent field, with a soft ramp
+    // across the middle so every alpha level from 0 to 255 is exercised.
+    function cutout(size: number): { data: Uint8Array, width: number, height: number } {
+      const data = new Uint8Array(size * size * 4)
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = (y * size + x) * 4
+          const inside = (x - size / 2) ** 2 + (y - size / 2) ** 2 < (size / 3) ** 2
+          data[i] = 200
+          data[i + 1] = 60
+          data[i + 2] = 40
+          data[i + 3] = y < 8 ? Math.round((x / (size - 1)) * 255) : inside ? 255 : 0
+        }
+      }
+      return { data, width: size, height: size }
+    }
+
+    it('round-trips transparency through its own decoder', () => {
+      const source = cutout(64)
+      const encoded = avif.encode(source, { quality: 90 })
+      const decoded = avif.decode(encoded)
+
+      expect(decoded.hasAlpha).toBe(true)
+      let worst = 0
+      let total = 0
+      for (let i = 3; i < source.data.length; i += 4) {
+        const error = Math.abs(decoded.data[i]! - source.data[i]!)
+        worst = Math.max(worst, error)
+        total += error
+      }
+      // Lossy, so not exact, but the mask must survive: fully transparent
+      // stays transparent, the disc stays solid, and the ramp stays a ramp.
+      expect(total / (64 * 64)).toBeLessThan(3)
+      expect(decoded.data[3]).toBeLessThan(8) // top-left of the ramp
+      expect(decoded.data[((40 * 64) + 2) * 4 + 3]).toBeLessThan(8) // outside the disc
+      expect(decoded.data[((32 * 64) + 32) * 4 + 3]).toBeGreaterThan(247) // centre of the disc
+      expect(worst).toBeLessThan(64)
+    })
+
+    it('stays a single item when every pixel is opaque', () => {
+      const encoded = avif.encode(createTestImageData(16, 16, { r: 10, g: 20, b: 30, a: 255 }))
+      expect(Buffer.from(encoded).toString('latin1')).not.toContain('auxiliary:alpha')
+      expect(avif.decode(encoded).hasAlpha ?? false).toBe(false)
+    })
+
+    it('drops alpha only when asked to', () => {
+      const encoded = avif.encode(cutout(32), { alpha: false })
+      expect(Buffer.from(encoded).toString('latin1')).not.toContain('auxiliary:alpha')
+    })
+  })
+
   describe('edge cases', () => {
     it('handles 1x1 image', () => {
       const imageData = createTestImageData(1, 1, { r: 255, g: 0, b: 0, a: 255 })

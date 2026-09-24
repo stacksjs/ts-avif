@@ -1,10 +1,9 @@
 import type { AvifAnimation, AvifDecodeOptions, AvifImageData } from './types'
 import type { AvifItemInfo } from './container/avif'
 import { decodeAV1, decodeAV1Sequence } from './av1/decoder'
-import { getAvifItemInfo, getItemPayload } from './container/avif'
+import { findAlphaItemId, getAvifItemInfo, getItemPayload } from './container/avif'
 import {
   findBox,
-  getAvifInfo,
   parseISOBMFF,
   parseIinf,
   validateFtyp,
@@ -43,9 +42,6 @@ export function decode(
   // Parse ISOBMFF boxes
   const boxes = parseISOBMFF(data)
 
-  // Get file info
-  const info = getAvifInfo(boxes)
-
   // Find the primary item
   const primaryItemId = getPrimaryItemId(boxes)
   if (primaryItemId === null) {
@@ -61,8 +57,10 @@ export function decode(
   // Decode AV1 bitstream
   const imageData = decodeAV1(av1Data)
 
-  // Handle alpha if present and not ignored
-  if (info.hasAlpha && !options.ignoreAlpha) {
+  // Handle alpha if present and not ignored. Asked of the item graph rather
+  // than `info.hasAlpha`, whose item-type check never matched a conformant
+  // file: alpha is an `av01` item, and `auxl` is the reference, not the type.
+  if (!options.ignoreAlpha) {
     const alphaItemId = getAlphaItemId(boxes)
     if (alphaItemId !== null) {
       const alphaData = getItemPayload(data, boxes, alphaItemId)
@@ -133,6 +131,14 @@ function getPrimaryItemId(boxes: any[]): number | null {
 }
 
 function getAlphaItemId(boxes: any[]): number | null {
+  // The spec-conformant form first: an `av01` item referencing the primary
+  // with `auxl` and typed by `auxC`. The item-type and name checks below are
+  // the heuristic this decoder used before, kept for files that only match
+  // those, since no conformant writer produces either.
+  const conformant = findAlphaItemId(boxes)
+  if (conformant !== null)
+    return conformant
+
   // Find meta box
   const metaBox = findBox(boxes, 'meta')
   if (!metaBox || !metaBox.children) {

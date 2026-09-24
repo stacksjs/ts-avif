@@ -117,6 +117,52 @@ export function parseIpma(data: Uint8Array): PropertyAssociation[] {
   return out
 }
 
+/**
+ * The item holding the primary image's alpha, or null.
+ *
+ * Per MIAF, alpha is an ordinary `av01` item that points at the image it
+ * belongs to with an `auxl` reference and says what it is with an `auxC`
+ * property. Checking the `auxC` type matters: a depth map is an auxiliary
+ * image too, and applying one as transparency would punch holes in a photo.
+ * `urn:mpeg:hevc:2015:auxid:1` is the older HEVC spelling some writers use.
+ */
+export function findAlphaItemId(boxes: ISOBMFFBox[]): number | null {
+  const metaBox = findBox(boxes, 'meta')
+  if (!metaBox?.children)
+    return null
+
+  const pitmBox = findBox(metaBox.children, 'pitm')
+  const primaryItemId = pitmBox ? parsePitm(pitmBox.data) : 1
+  const irefBox = findBox(metaBox.children, 'iref')
+  const candidates = (irefBox ? parseIref(irefBox) : [])
+    .filter(ref => ref.referenceType === 'auxl' && ref.toItemIds.includes(primaryItemId))
+    .map(ref => ref.fromItemId)
+  if (candidates.length === 0)
+    return null
+
+  const iprpBox = findBox(metaBox.children, 'iprp')
+  const ipcoBox = iprpBox?.children ? findBox(iprpBox.children, 'ipco') : undefined
+  const ipmaBox = iprpBox?.children ? findBox(iprpBox.children, 'ipma') : undefined
+  const properties = ipcoBox?.children ?? []
+  const associations = ipmaBox ? parseIpma(ipmaBox.data) : []
+
+  for (const itemId of candidates) {
+    const indexes = associations.find(a => a.itemId === itemId)?.propertyIndexes ?? []
+    for (const index of indexes) {
+      const property = properties[index - 1]
+      if (property?.type !== 'auxC')
+        continue
+      // FullBox header, then a null-terminated URN.
+      const bytes = property.data.subarray(4)
+      const end = bytes.indexOf(0)
+      const urn = new TextDecoder().decode(end === -1 ? bytes : bytes.subarray(0, end))
+      if (urn === 'urn:mpeg:mpegB:cicp:systems:auxiliary:alpha' || urn === 'urn:mpeg:hevc:2015:auxid:1')
+        return itemId
+    }
+  }
+  return null
+}
+
 /** Parse a `grid` derived-image item body. */
 export function parseGridBody(data: Uint8Array): Omit<AvifGridInfo, 'tileItemIds' | 'tileWidth' | 'tileHeight'> {
   const flags = data[1]
@@ -183,7 +229,7 @@ export function getAvifItemInfo(buffer: Uint8Array, boxes: ISOBMFFBox[]): AvifIt
 
   const irefBox = findBox(metaBox.children, 'iref')
   const refs = irefBox ? parseIref(irefBox) : []
-  const hasAlpha = items.some(i => i.itemType === 'auxl')
+  const hasAlpha = findAlphaItemId(boxes) !== null || items.some(i => i.itemType === 'auxl')
 
   let grid: AvifGridInfo | null = null
   let av1C: AV1CodecConfig | null = null

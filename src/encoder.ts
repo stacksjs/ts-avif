@@ -1,18 +1,33 @@
 import type { AvifEncodeOptions, AvifImageData } from './types'
 import { OBUType } from './types'
 import { encodeFrameHeader, encodeSequenceHeader } from './av1/encode-headers'
-import { encodeIntraTile, rgbaToYuv420 } from './av1/encode-tile'
+import { alphaToYuv420, encodeIntraTile, rgbaToYuv420 } from './av1/encode-tile'
 import { createOBU } from './av1/obu'
 import { writeAvif } from './container/writer'
 
-/** Encode opaque 8-bit RGBA pixels with the bundled TypeScript AV1 encoder. */
+/**
+ * Encode 8-bit RGBA pixels with the bundled TypeScript AV1 encoder.
+ *
+ * Any pixel that is not fully opaque makes this a two-item file: the colour
+ * image, plus an alpha auxiliary image linked to it, which is how every AVIF
+ * decoder expects transparency. Pass `alpha: false` to flatten instead.
+ */
 export function encode(
   imageData: AvifImageData,
   options: AvifEncodeOptions = {},
 ): Uint8Array {
   validateOptions(imageData, options)
-  const av1 = encodeAV1(imageData.data, imageData.width, imageData.height, options)
-  return writeAvif(av1, imageData.width, imageData.height)
+  const { data, width, height } = imageData
+  const translucent = options.alpha !== false && hasTranslucentPixel(data)
+
+  // The colour pass ignores alpha whenever alpha is handled some other way:
+  // written as its own item, or dropped because the caller asked for that.
+  const color = encodeAV1(data, width, height, options, translucent || options.alpha === false)
+  if (!translucent)
+    return writeAvif(color, width, height)
+
+  const alpha = encodePlane(alphaToYuv420(data, width, height), width, height, options.alphaQuality ?? options.quality ?? 80)
+  return writeAvif(color, width, height, alpha)
 }
 
 /** Promise-returning form retained for callers with an asynchronous pipeline. */
@@ -29,15 +44,27 @@ export function encodeAV1(
   width: number,
   height: number,
   options: AvifEncodeOptions = {},
+  alphaEncodedSeparately = false,
 ): Uint8Array {
   validateCodecOptions(options)
-  const q = qualityToQIndex(options.quality ?? 80)
+  return encodePlane(rgbaToYuv420(rgba, width, height, { alphaEncodedSeparately }), width, height, options.quality ?? 80)
+}
+
+function encodePlane(source: ReturnType<typeof rgbaToYuv420>, width: number, height: number, quality: number): Uint8Array {
+  const q = qualityToQIndex(quality)
   const sequence = createOBU(OBUType.SEQUENCE_HEADER, encodeSequenceHeader(width, height))
   const frameHeader = encodeFrameHeader(width, height, q)
-  const tile = encodeIntraTile(rgbaToYuv420(rgba, width, height), q)
-  const framePayload = concat([frameHeader, tile])
-  const frame = createOBU(OBUType.FRAME, framePayload)
+  const tile = encodeIntraTile(source, q)
+  const frame = createOBU(OBUType.FRAME, concat([frameHeader, tile]))
   return concat([sequence, frame])
+}
+
+function hasTranslucentPixel(rgba: Uint8Array): boolean {
+  for (let i = 3; i < rgba.length; i += 4) {
+    if (rgba[i] !== 255)
+      return true
+  }
+  return false
 }
 
 /** Map the public quality scale to AV1's inverse 8-bit base quantizer. */
@@ -57,9 +84,9 @@ function validateOptions(imageData: AvifImageData, options: AvifEncodeOptions): 
     throw new Error('ts-avif: imageData.data must be RGBA (width × height × 4 bytes)')
   if (imageData.bitDepth !== undefined && imageData.bitDepth !== 8)
     throw new Error('ts-avif: pure TypeScript encoder currently supports only 8-bit input')
-  if (options.alpha || imageData.hasAlpha)
-    throw new Error('ts-avif: alpha encoding is not implemented yet')
   validateCodecOptions(options)
+  if (options.alphaQuality !== undefined)
+    qualityToQIndex(options.alphaQuality)
 }
 
 function validateCodecOptions(options: AvifEncodeOptions): void {

@@ -59,7 +59,12 @@ class EncoderContext {
 }
 
 /** Convert opaque RGBA pixels to the encoder's full-range BT.709 4:2:0 planes. */
-export function rgbaToYuv420(data: Uint8Array, width: number, height: number): Yuv420 {
+export function rgbaToYuv420(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  options: { alphaEncodedSeparately?: boolean } = {},
+): Yuv420 {
   if (data.byteLength !== width * height * 4)
     throw new Error('ts-avif: imageData.data must be RGBA (width × height × 4 bytes)')
 
@@ -78,7 +83,9 @@ export function rgbaToYuv420(data: Uint8Array, width: number, height: number): Y
     for (let px = 0; px < yStride; px++) {
       const sx = Math.min(px, width - 1)
       const src = (sy * width + sx) * 4
-      if (data[src + 3] !== 255)
+      // Refuse to drop alpha silently. The encoder passes
+      // `alphaEncodedSeparately` when it writes alpha as its own item.
+      if (data[src + 3] !== 255 && !options.alphaEncodedSeparately)
         throw new Error('ts-avif: alpha encoding is not implemented; input pixels must be opaque')
       const r = data[src]
       const g = data[src + 1]
@@ -108,6 +115,41 @@ export function rgbaToYuv420(data: Uint8Array, width: number, height: number): Y
     }
   }
 
+  return { y, u, v, yStride, uvStride, miCols, miRows }
+}
+
+/**
+ * The alpha plane as an AV1 picture: alpha in luma, neutral chroma.
+ *
+ * AVIF carries alpha as a second image item whose luma plane IS the alpha
+ * (MIAF auxiliary image, `urn:mpeg:mpegB:cicp:systems:auxiliary:alpha`).
+ * Decoders read only that plane, so writing it through the same 4:2:0 path
+ * as the colour image, with chroma pinned to 128, keeps one encoder for both.
+ * Edge replication matches `rgbaToYuv420` so the planes line up block for
+ * block.
+ */
+export function alphaToYuv420(data: Uint8Array, width: number, height: number): Yuv420 {
+  if (data.byteLength !== width * height * 4)
+    throw new Error('ts-avif: imageData.data must be RGBA (width × height × 4 bytes)')
+
+  const miCols = 2 * ((width + 7) >> 3)
+  const miRows = 2 * ((height + 7) >> 3)
+  const yStride = miCols * 4
+  const yHeight = miRows * 4
+  const uvStride = yStride >> 1
+  const uvHeight = yHeight >> 1
+  const y = new Uint8Array(yStride * yHeight)
+
+  for (let py = 0; py < yHeight; py++) {
+    const sy = Math.min(py, height - 1)
+    for (let px = 0; px < yStride; px++) {
+      const sx = Math.min(px, width - 1)
+      y[py * yStride + px] = data[(sy * width + sx) * 4 + 3]!
+    }
+  }
+
+  const u = new Uint8Array(uvStride * uvHeight).fill(128)
+  const v = new Uint8Array(uvStride * uvHeight).fill(128)
   return { y, u, v, yStride, uvStride, miCols, miRows }
 }
 
