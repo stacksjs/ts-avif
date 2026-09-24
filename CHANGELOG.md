@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.4...v0.1.5)
+
+## 🚀 Features
+
+- encode alpha as an auxiliary image and decode it per spec ([8a72328](https://github.com/stacksjs/ts-avif/commit/8a72328)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🧹 Chores
+
+- release v0.1.5 ([6588313](https://github.com/stacksjs/ts-avif/commit/6588313)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/stacksjs/ts-avif/compare/v0.1.3...v0.1.4)
 
 ## ⚡ Performance Improvements
