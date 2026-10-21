@@ -4,7 +4,7 @@ export { getAvifItemInfo, getItemPayload, parseGridBody, parseIpma, parseIref, p
 export { getAvifTrack } from './container/sequence'
 export { encode, encodeAsync, encodeAV1, qualityToQIndex } from './encoder'
 export { optimize, optimizeWithStats, remux } from './optimize'
-export type { OptimizeResult, OptimizeStats } from './optimize'
+export type { OptimizeOptions, OptimizeResult, OptimizeStats } from './optimize'
 export {
   parseISOBMFF,
   findBox,

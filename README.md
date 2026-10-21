@@ -222,3 +222,5 @@ Interoperability and reference vectors were validated with [dav1d](https://code.
 ## License
 
 MIT
+
+For lossless container compression that also retains EXIF, XMP and profiles, use `optimize(bytes, { preserveMetadata: true })` or strict `remux(bytes, { preserveMetadata: true })`. Alpha and derived-image dependencies survive remuxing. Movie timelines pass through intact. Malformed box lengths are rejected.

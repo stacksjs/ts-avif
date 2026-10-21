@@ -11,13 +11,14 @@ import type {
 /**
  * Parse ISOBMFF (ISO Base Media File Format) boxes
  */
-export function parseISOBMFF(buffer: Uint8Array): ISOBMFFBox[] {
+export function parseISOBMFF(buffer: Uint8Array, depth = 0): ISOBMFFBox[] {
+  if (depth > 64) throw new Error('ISOBMFF nesting exceeds 64 levels')
   const boxes: ISOBMFFBox[] = []
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
 
   let offset = 0
 
-  while (offset < buffer.length - 8) {
+  while (offset + 8 <= buffer.length) {
     const size = view.getUint32(offset)
     const type = String.fromCharCode(
       buffer[offset + 4],
@@ -31,6 +32,7 @@ export function parseISOBMFF(buffer: Uint8Array): ISOBMFFBox[] {
 
     if (size === 1) {
       // 64-bit size
+      if (offset + 16 > buffer.length) throw new Error('Truncated extended ISOBMFF header')
       const highSize = view.getUint32(offset + 8)
       const lowSize = view.getUint32(offset + 12)
       boxSize = highSize * 0x100000000 + lowSize
@@ -40,6 +42,9 @@ export function parseISOBMFF(buffer: Uint8Array): ISOBMFFBox[] {
       // Box extends to end of file
       boxSize = buffer.length - offset
     }
+
+    if (!Number.isSafeInteger(boxSize) || boxSize < headerSize || offset + boxSize > buffer.length)
+      throw new Error('Invalid or truncated ISOBMFF box size')
 
     // subarray is a view into the same memory — slice would copy. For a
     // typical AVIF with a few dozen nested boxes this avoids ≈ N×fileSize
@@ -62,13 +67,15 @@ export function parseISOBMFF(buffer: Uint8Array): ISOBMFFBox[] {
       // FullBoxes in our `containerTypes` list — both need the skip.
       const isFullBoxContainer = type === 'meta' || type === 'iref'
       const childrenStart = isFullBoxContainer ? 4 : 0
-      box.children = parseISOBMFF(data.subarray(childrenStart))
+      if (data.length < childrenStart) throw new Error('Truncated ISOBMFF full-box header')
+      box.children = parseISOBMFF(data.subarray(childrenStart), depth + 1)
     }
 
     boxes.push(box)
     offset += boxSize
   }
 
+  if (offset !== buffer.length) throw new Error('Truncated ISOBMFF box header')
   return boxes
 }
 
@@ -166,7 +173,7 @@ export function parseIloc(data: Uint8Array): ItemLocation[] {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
 
   const version = data[0]
-  const flags = (data[1] << 16) | (data[2] << 8) | data[3]
+  const _flags = (data[1] << 16) | (data[2] << 8) | data[3]
 
   const offsetSize = (data[4] >> 4) & 0x0F
   const lengthSize = data[4] & 0x0F

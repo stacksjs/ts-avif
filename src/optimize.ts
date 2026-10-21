@@ -32,11 +32,17 @@ import {
   parseIinf,
   parseIloc,
   parseISOBMFF,
+  validateFtyp,
 } from './container/heif'
 import type { ItemInfo } from './types'
 
 /** Item types that are pure metadata and never carry pixel data. */
 const METADATA_ITEM_TYPES = new Set(['Exif', 'mime', 'uri '])
+
+export interface OptimizeOptions {
+  /** Keep EXIF, XMP, profiles and other metadata items. Default false. */
+  preserveMetadata?: boolean
+}
 
 /** Per-call summary of what the optimizer touched. */
 export interface OptimizeStats {
@@ -65,17 +71,17 @@ export interface OptimizeResult {
  *
  * On any parse/serialize failure, the original input is returned unchanged.
  */
-export function optimize(input: Uint8Array): Uint8Array {
-  return optimizeWithStats(input).bytes
+export function optimize(input: Uint8Array, options: OptimizeOptions = {}): Uint8Array {
+  return optimizeWithStats(input, options).bytes
 }
 
 /**
  * Same as `optimize()` but also returns a stats object describing what was
  * dropped — useful for UIs that want to show the user `−15 % (Exif + thumbnail)`.
  */
-export function optimizeWithStats(input: Uint8Array): OptimizeResult {
+export function optimizeWithStats(input: Uint8Array, options: OptimizeOptions = {}): OptimizeResult {
   try {
-    const result = remuxWithStats(input)
+    const result = remuxWithStats(input, options)
     if (result.bytes.length < input.length) {
       return { bytes: result.bytes, stats: { ...result.stats, passthrough: false } }
     }
@@ -104,12 +110,18 @@ export function optimizeWithStats(input: Uint8Array): OptimizeResult {
  * buffer; callers that want to keep the original on bloat should use
  * `optimize()` instead.
  */
-export function remux(input: Uint8Array): Uint8Array {
-  return remuxWithStats(input).bytes
+export function remux(input: Uint8Array, options: OptimizeOptions = {}): Uint8Array {
+  return remuxWithStats(input, options).bytes
 }
 
-function remuxWithStats(input: Uint8Array): OptimizeResult {
+function remuxWithStats(input: Uint8Array, options: OptimizeOptions): OptimizeResult {
+  if (!validateFtyp(input)) throw new Error('not an AVIF: invalid file type')
   const boxes = parseISOBMFF(input)
+  // A movie timeline is a separate container structure. Retain it intact;
+  // rebuilding only meta/mdat would silently discard animation.
+  if (boxes.some(box => box.type === 'moov' || box.type === 'moof')) {
+    return { bytes: input, stats: { passthrough: true, keptItemIds: [], droppedItemIds: [], droppedItemTypes: [], bytesSaved: 0 } }
+  }
 
   const ftyp = boxes.find(b => b.type === 'ftyp')
   const meta = boxes.find(b => b.type === 'meta')
@@ -132,19 +144,29 @@ function remuxWithStats(input: Uint8Array): OptimizeResult {
   if (!ilocBox) throw new Error('no iloc — item locations missing')
   const allLocations = parseIloc(ilocBox.data)
 
-  // Build the keep set:
-  //   1. Primary item
-  //   2. Anything the primary points at via `auxl` (alpha aux)
-  //   3. Anything that points at the primary via `cdsc` is metadata — DROP
-  //   4. Drop anything with metadata item type
+  // Preserve the rendered dependency graph: derived images point at tiles,
+  // while auxiliary images (including alpha) point back at their master.
   const keep = new Set<number>([primaryItemId])
-  for (const ref of refs) {
-    if (ref.fromId === primaryItemId && ref.type === 'auxl') {
-      for (const t of ref.toIds) keep.add(t)
+  if (options.preserveMetadata) {
+    for (const item of allItems) {
+      if (METADATA_ITEM_TYPES.has(item.itemType)) keep.add(item.itemId)
     }
   }
-  for (const item of allItems) {
-    if (METADATA_ITEM_TYPES.has(item.itemType)) keep.delete(item.itemId)
+  let changed = true
+  while (changed) {
+    const size = keep.size
+    for (const ref of refs) {
+      if (ref.type === 'auxl' && ref.toIds.some(id => keep.has(id))) keep.add(ref.fromId)
+      if (keep.has(ref.fromId) && !['thmb', 'cdsc'].includes(ref.type)) {
+        for (const id of ref.toIds) keep.add(id)
+      }
+    }
+    changed = size !== keep.size
+  }
+  if (!options.preserveMetadata) {
+    for (const item of allItems) {
+      if (METADATA_ITEM_TYPES.has(item.itemType)) keep.delete(item.itemId)
+    }
   }
   // Always keep primary (defensive — metadata-typed primary items are nonsense
   // but a malformed file shouldn't make us produce empty output).

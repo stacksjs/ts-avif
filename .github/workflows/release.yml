@@ -1,36 +1,31 @@
 name: Releaser
-
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
-
+permissions:
+  contents: write
+  id-token: write
 jobs:
   npm:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - name: Setup Pantry
-        uses: home-lang/pantry/packages/action@main
-
-      - name: Install Dependencies
-        run: bun install
-
-      - name: Publish
-        run: pantry publish --npm --access public
+      - uses: pantry-pm/pantry/packages/action@d160044a6fe4ad7e8463828f80dfbc55bcdc07d9
+        with:
+          version: '0.11.109'
+          install: 'false'
+          packages: bun.com@1.4.3
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run lint
+      - run: bun run build
+      - run: pantry publish --npm --access public .
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Create GitHub Release
-        uses: stacksjs/action-releaser@v1.2.9
+      - uses: stacksjs/action-releaser@v1.2.9
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
